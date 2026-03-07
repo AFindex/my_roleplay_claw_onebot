@@ -1,0 +1,73 @@
+{
+  "id": "my-claw-onebot",
+  "name": "MyClaw OneBot",
+  "version": "0.1.0",
+  "description": "Minimal OneBot v11 protocol channel plugin",
+  "author": "OpenAI Codex",
+  "channels": ["onebot"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "type": {
+        "type": "string",
+        "enum": ["forward-websocket", "backward-websocket"],
+        "description": "连接类型：正向或反向 WebSocket"
+      },
+      "host": {
+        "type": "string",
+        "description": "OneBot 主机地址"
+      },
+      "port": {
+        "type": "number",
+        "description": "OneBot 端口"
+      },
+      "accessToken": {
+        "type": "string",
+        "description": "访问令牌（可选）"
+      },
+      "path": {
+        "type": "string",
+        "description": "WebSocket 路径，默认 /onebot/v11/ws"
+      },
+      "requireMention": {
+        "type": "boolean",
+        "default": true,
+        "description": "群聊是否必须 @ 机器人才回复"
+      },
+      "renderMarkdownToPlain": {
+        "type": "boolean",
+        "default": true,
+        "description": "是否将机器人回复中的 Markdown 渲染为纯文本"
+      },
+      "groupIncrease": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "message": {
+            "type": "string",
+            "description": "欢迎语模板，支持 {name} / {groupName} / {userId} / {groupId} / {avatarUrl}"
+          }
+        }
+      }
+    }
+  },
+  "uiHints": {
+    "accessToken": {
+      "label": "Access Token",
+      "sensitive": true
+    },
+    "host": {
+      "label": "主机地址",
+      "placeholder": "127.0.0.1"
+    },
+    "port": {
+      "label": "端口",
+      "placeholder": "3001"
+    }
+  }
+}
+
