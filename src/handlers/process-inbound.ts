@@ -448,8 +448,8 @@ function appendOriginalSessionUserMirror(params: {
   originalSessionKey: string;
   storePath: string;
   timestampMs?: number;
-}): void {
-  appendSessionUserMessage({
+}): { ok: boolean; reason?: string; sessionFile?: string } {
+  return appendSessionUserMessage({
     body: params.body,
     fallbackText: params.fallbackText,
     logger: params.logger,
@@ -467,8 +467,8 @@ function appendOriginalSessionAssistantMirror(params: {
   storePath: string;
   text?: string;
   timestampMs?: number;
-}): void {
-  appendSessionAssistantMessage({
+}): { ok: boolean; reason?: string; sessionFile?: string } {
+  return appendSessionAssistantMessage({
     logger: params.logger,
     mediaUrls: params.mediaUrls,
     model: params.model,
@@ -477,6 +477,63 @@ function appendOriginalSessionAssistantMirror(params: {
     text: params.text,
     timestampMs: params.timestampMs
   });
+}
+
+function delayMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function appendOriginalSessionUserMirrorWithRetry(params: {
+  body: unknown;
+  fallbackText: string;
+  logger?: { info?: (value: string) => void; warn?: (value: string) => void };
+  originalSessionKey: string;
+  storePath: string;
+  timestampMs?: number;
+}): Promise<void> {
+  let result = appendOriginalSessionUserMirror(params);
+  if (result.ok || result.reason !== "unknown session") {
+    return;
+  }
+
+  for (let attempt = 1; attempt <= 5; attempt += 1) {
+    await delayMs(attempt * 40);
+    result = appendOriginalSessionUserMirror(params);
+    if (result.ok) {
+      params.logger?.info?.(`[onebot] session user mirror recovered attempt=${attempt} sessionKey=${params.originalSessionKey}`);
+      return;
+    }
+    if (result.reason !== "unknown session") {
+      return;
+    }
+  }
+}
+
+async function appendOriginalSessionAssistantMirrorWithRetry(params: {
+  logger?: { info?: (value: string) => void; warn?: (value: string) => void };
+  mediaUrls?: string[];
+  model?: string;
+  originalSessionKey: string;
+  storePath: string;
+  text?: string;
+  timestampMs?: number;
+}): Promise<void> {
+  let result = appendOriginalSessionAssistantMirror(params);
+  if (result.ok || result.reason !== "unknown session") {
+    return;
+  }
+
+  for (let attempt = 1; attempt <= 5; attempt += 1) {
+    await delayMs(attempt * 40);
+    result = appendOriginalSessionAssistantMirror(params);
+    if (result.ok) {
+      params.logger?.info?.(`[onebot] session assistant mirror recovered attempt=${attempt} sessionKey=${params.originalSessionKey} model=${params.model ?? "onebot-async-mirror"}`);
+      return;
+    }
+    if (result.reason !== "unknown session") {
+      return;
+    }
+  }
 }
 
 async function resolveAsyncTaskUntrustedContext(api: any, params: {
@@ -972,7 +1029,7 @@ async function handleDetachedAsyncReply(api: any, runtime: any, params: {
     await deliverCapturedReply(api, params.target, polished.reply);
 
     const mirroredReplyText = buildCapturedReplyMirrorText(polished.reply);
-    appendOriginalSessionAssistantMirror({
+    await appendOriginalSessionAssistantMirrorWithRetry({
       logger: api.logger,
       mediaUrls: polished.reply.mediaUrls,
       model: "onebot-async-final",
@@ -999,7 +1056,7 @@ async function handleDetachedAsyncReply(api: any, runtime: any, params: {
     const failText = buildAsyncFailureText(error);
     api.logger?.error?.(`[onebot] async dispatch failed: ${error instanceof Error ? error.message : String(error)}`);
     await sendFailureMessage(api, params.target, error, "刚才那个异步任务失败了");
-    appendOriginalSessionAssistantMirror({
+    await appendOriginalSessionAssistantMirrorWithRetry({
       logger: api.logger,
       model: "onebot-async-failure",
       originalSessionKey: params.originalSessionKey,
@@ -1161,7 +1218,7 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
       sessionKey,
       storePath
     });
-    appendOriginalSessionUserMirror({
+    await appendOriginalSessionUserMirrorWithRetry({
       body: originalCtxPayload.Body,
       fallbackText: messageText,
       logger: api.logger,
@@ -1189,7 +1246,7 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
       ackText,
       target: replyTarget
     });
-    appendOriginalSessionAssistantMirror({
+    await appendOriginalSessionAssistantMirrorWithRetry({
       logger: api.logger,
       model: "onebot-async-ack",
       originalSessionKey: sessionKey,
@@ -1216,7 +1273,7 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
           const failText = buildAsyncFailureText(error);
           api.logger?.error?.(`[onebot] async dispatch failed (original session): ${error instanceof Error ? error.message : String(error)}`);
           await sendFailureMessage(api, replyTarget, error, "刚才那个异步任务失败了");
-          appendOriginalSessionAssistantMirror({
+          await appendOriginalSessionAssistantMirrorWithRetry({
             logger: api.logger,
             model: "onebot-async-failure",
             originalSessionKey: sessionKey,
