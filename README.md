@@ -113,6 +113,9 @@ npm run test:connect
 - 原来的群/私聊主会话不会被这个长任务卡住
 - 后台拿到原始结果后，还会再结合最近对话上下文做一轮润色
 - 最后再向原聊天单独发一条更自然的最终回复
+- 异步任务的用户原话、即时应答、最终结果/失败信息，都会镜像回原主会话 transcript
+- 另外会在 agent 的 sessions 目录下单独维护 `onebot-async-records.json`，记录异步子 session、状态和结果摘要
+- 当用户在原会话里追问“刚才那个异步任务”时，会先检索这份记录，再把匹配到的状态作为 untrusted context 注入主会话，让角色自然接话
 
 可选配置示例：
 
@@ -133,6 +136,7 @@ npm run test:connect
           "apiKey": "<YOUR_MOONSHOT_API_KEY>",
           "judgeModel": "kimi-k2-turbo-preview",
           "ackModel": "kimi-k2-turbo-preview",
+          "searchModel": "kimi-k2-turbo-preview",
           "timeoutMs": 3500,
           "maxTokens": 48,
           "temperature": 0.6,
@@ -147,10 +151,10 @@ npm run test:connect
 说明：
 
 - 现在默认会优先启用 AI 快速判定；如果没配 API Key 或请求失败，会回退到关键词判定
-- 默认会分别读取 `ai.judgeModel` 和 `ai.ackModel`；若没配，会向后兼容旧的 `ai.model`
-- 当前默认判断模型与应答模型都是 `kimi-k2-turbo-preview`，温度默认是 `0.6`，并且请求会显式带上 `thinking: "off"`
+- 默认会分别读取 `ai.judgeModel`、`ai.ackModel` 和 `ai.searchModel`；若没配，会向后兼容旧的 `ai.model`
+- 当前默认判断模型、即时应答模型、异步记录检索模型都是 `kimi-k2-turbo-preview`，温度默认是 `0.6`，并且请求会显式带上 `thinking: "off"`
 - 如果你不想把 key 写进配置，也可以通过环境变量 `ONEBOT_ASYNC_AI_API_KEY` 或 `MOONSHOT_API_KEY` 提供
-- 也支持分别用 `ONEBOT_ASYNC_AI_JUDGE_MODEL` 与 `ONEBOT_ASYNC_AI_ACK_MODEL` 覆盖这两个模型；旧的 `ONEBOT_ASYNC_AI_MODEL` 仍可作为兼容回退
+- 也支持分别用 `ONEBOT_ASYNC_AI_JUDGE_MODEL`、`ONEBOT_ASYNC_AI_ACK_MODEL` 与 `ONEBOT_ASYNC_AI_SEARCH_MODEL` 覆盖这三个模型；旧的 `ONEBOT_ASYNC_AI_MODEL` 仍可作为兼容回退
 - `asyncReply.enabled=false` 时会关闭自动判定，但显式 `/async` 仍然可用
 
 ## 人设模板

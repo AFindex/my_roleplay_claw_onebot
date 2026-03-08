@@ -2,10 +2,22 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 
 import { buildAgentPersonaContext } from "../agent-persona.js";
 import { generateAsyncAckWithAi } from "../async-ack-ai.js";
+import { matchAsyncTaskRecordWithAi } from "../async-record-search-ai.js";
+import {
+  buildAsyncTaskContextBlock,
+  createAsyncTaskRecord,
+  getAsyncTaskRecordById,
+  listAsyncTaskRecordsForSession,
+  updateAsyncTaskRecord,
+  upsertAsyncTaskRecord,
+  type AsyncTaskRecord,
+  type AsyncTaskTriggerMeta
+} from "../async-task-records.js";
 import { getAsyncReplyConfig, getGroupIncreaseConfig, getOneBotConfig, getRenderMarkdownToPlain, getRequireMention, type OneBotAsyncReplyConfig } from "../config.js";
 import { classifyAsyncIntentWithAi } from "../async-intent-ai.js";
 import { getImage, getMsg, sendGroupImage, sendGroupMsg, sendPrivateImage, sendPrivateMsg, stageInboundImageToLocalPath } from "../connection.js";
 import { collapseDoubleNewlines, markdownToPlain } from "../markdown.js";
+import { appendSessionAssistantMessage, appendSessionUserMessage } from "../session-transcript-mirror.js";
 import { getImageSegments, getRawText, getReplyMessageId, getTextFromMessageContent, getTextFromSegments, isMentioned } from "../message.js";
 import { clearActiveReplyTarget, setActiveReplyTarget } from "../reply-context.js";
 import type { OneBotMessage } from "../types.js";
@@ -320,8 +332,9 @@ function buildInboundContext(api: any, runtime: any, params: {
   messageText: string;
   replyTarget: ReplyTarget;
   sessionKey: string;
+  untrustedContext?: string[];
 }): Record<string, unknown> {
-  const { mediaAttachments = [], messageText, replyTarget, sessionKey } = params;
+  const { mediaAttachments = [], messageText, replyTarget, sessionKey, untrustedContext } = params;
   const envelopeOptions = runtime.channel.reply?.resolveEnvelopeFormatOptions?.(api.config) ?? {};
   const body = runtime.channel.reply?.formatInboundEnvelope?.({
     channel: "OneBot",
@@ -365,6 +378,7 @@ function buildInboundContext(api: any, runtime: any, params: {
       to: replyTarget.replyTarget,
       accountId: getOneBotConfig(api)?.accountId ?? "default"
     },
+    UntrustedContext: Array.isArray(untrustedContext) && untrustedContext.length > 0 ? untrustedContext : undefined,
     _onebot: {
       userId: replyTarget.userId,
       groupId: replyTarget.groupId,
@@ -396,6 +410,109 @@ async function recordInboundSession(api: any, runtime: any, params: {
     onRecordError: (error: unknown) => {
       api.logger?.warn?.(`[onebot] recordInboundSession failed: ${String(error)}`);
     }
+  });
+}
+
+function buildAsyncFailureText(error: unknown, prefix = "刚才那个异步任务失败了"): string {
+  const reason = error instanceof Error ? error.message : String(error);
+  return `${prefix}: ${reason.slice(0, 120)}`;
+}
+
+function toAsyncTriggerMeta(trigger: AsyncTrigger): AsyncTaskTriggerMeta {
+  return {
+    confidence: trigger.confidence,
+    keyword: trigger.keyword,
+    mode: trigger.mode,
+    reason: trigger.reason
+  };
+}
+
+function buildCapturedReplyMirrorText(captured: CapturedReply): string | undefined {
+  const finalText = collapseDoubleNewlines(captured.textParts.filter(Boolean).join("\n\n")).trim();
+  if (finalText) {
+    return finalText;
+  }
+  if (captured.mediaUrls.length > 0) {
+    return captured.mediaUrls.length > 1 ? `（发送了 ${captured.mediaUrls.length} 个媒体）` : "（发送了 1 个媒体）";
+  }
+  return undefined;
+}
+
+function appendOriginalSessionUserMirror(params: {
+  body: unknown;
+  fallbackText: string;
+  logger?: { warn?: (value: string) => void };
+  originalSessionKey: string;
+  storePath: string;
+  timestampMs?: number;
+}): void {
+  appendSessionUserMessage({
+    body: params.body,
+    fallbackText: params.fallbackText,
+    logger: params.logger,
+    sessionKey: params.originalSessionKey,
+    storePath: params.storePath,
+    timestampMs: params.timestampMs
+  });
+}
+
+function appendOriginalSessionAssistantMirror(params: {
+  logger?: { warn?: (value: string) => void };
+  mediaUrls?: string[];
+  model?: string;
+  originalSessionKey: string;
+  storePath: string;
+  text?: string;
+  timestampMs?: number;
+}): void {
+  appendSessionAssistantMessage({
+    logger: params.logger,
+    mediaUrls: params.mediaUrls,
+    model: params.model,
+    sessionKey: params.originalSessionKey,
+    storePath: params.storePath,
+    text: params.text,
+    timestampMs: params.timestampMs
+  });
+}
+
+async function resolveAsyncTaskUntrustedContext(api: any, params: {
+  asyncConfig: ReturnType<typeof getAsyncReplyConfig>;
+  messageText: string;
+  originalSessionKey: string;
+  storePath: string;
+}): Promise<string | undefined> {
+  const records = listAsyncTaskRecordsForSession({
+    storePath: params.storePath,
+    originalSessionKey: params.originalSessionKey,
+    limit: 10
+  });
+  if (records.length === 0) {
+    return undefined;
+  }
+
+  const match = await matchAsyncTaskRecordWithAi({
+    apiConfig: params.asyncConfig.ai,
+    logger: api.logger,
+    messageText: params.messageText,
+    records
+  });
+  if (!match.matched || !match.recordId) {
+    return undefined;
+  }
+
+  const record = getAsyncTaskRecordById({
+    recordId: match.recordId,
+    storePath: params.storePath
+  }) ?? records.find((item) => item.id === match.recordId);
+  if (!record) {
+    return undefined;
+  }
+
+  return buildAsyncTaskContextBlock({
+    confidence: match.confidence,
+    matchReason: match.reason,
+    record
   });
 }
 
@@ -680,7 +797,7 @@ async function buildPolishedAsyncReply(api: any, runtime: any, params: {
   rawReply: CapturedReply;
   storePath: string;
   target: ReplyTarget;
-}): Promise<CapturedReply> {
+}): Promise<{ polishSessionKey: string; reply: CapturedReply }> {
   const contextExcerpt = readRecentConversationExcerpt({
     contextCharLimit: params.asyncConfig.contextCharLimit,
     recentMessages: params.asyncConfig.recentMessages,
@@ -714,9 +831,12 @@ async function buildPolishedAsyncReply(api: any, runtime: any, params: {
     polished.mediaUrls = [...params.rawReply.mediaUrls];
   }
 
-  return polished.textParts.length > 0 || polished.mediaUrls.length > 0
-    ? polished
-    : params.rawReply;
+  return {
+    polishSessionKey,
+    reply: polished.textParts.length > 0 || polished.mediaUrls.length > 0
+      ? polished
+      : params.rawReply
+  };
 }
 
 async function sendAsyncAcceptedReply(api: any, params: {
@@ -765,29 +885,52 @@ async function handleDetachedAsyncReply(api: any, runtime: any, params: {
   originalSessionKey: string;
   storePath: string;
   target: ReplyTarget;
+  taskRecordId: string;
+  taskSessionKey: string;
 }): Promise<void> {
-  const asyncSessionKey = buildAsyncSessionKey(params.agentId, params.target, "task");
   const ctxPayload = buildInboundContext(api, runtime, {
     mediaAttachments: params.mediaAttachments,
     messageText: params.messageText,
     replyTarget: params.target,
-    sessionKey: asyncSessionKey
+    sessionKey: params.taskSessionKey
   });
 
   await recordInboundSession(api, runtime, {
     ctx: ctxPayload,
     replyTarget: params.target.replyTarget,
-    sessionKey: asyncSessionKey,
+    sessionKey: params.taskSessionKey,
     storePath: params.storePath
+  });
+
+  updateAsyncTaskRecord({
+    recordId: params.taskRecordId,
+    storePath: params.storePath,
+    mutate: (current) => ({
+      ...current,
+      startedAt: current.startedAt ?? Date.now(),
+      status: "running",
+      updatedAt: Date.now()
+    })
   });
 
   try {
     const rawReply = await captureReply(api, runtime, ctxPayload);
     if (rawReply.textParts.length === 0 && rawReply.mediaUrls.length === 0) {
+      updateAsyncTaskRecord({
+        recordId: params.taskRecordId,
+        storePath: params.storePath,
+        mutate: (current) => ({
+          ...current,
+          completedAt: Date.now(),
+          note: "empty_result",
+          status: "completed",
+          updatedAt: Date.now()
+        })
+      });
       return;
     }
 
-    const finalReply = await buildPolishedAsyncReply(api, runtime, {
+    const polished = await buildPolishedAsyncReply(api, runtime, {
       agentId: params.agentId,
       asyncConfig: params.asyncConfig,
       originalRequestText: params.originalRequestText,
@@ -797,10 +940,55 @@ async function handleDetachedAsyncReply(api: any, runtime: any, params: {
       target: params.target
     });
 
-    await deliverCapturedReply(api, params.target, finalReply);
+    await deliverCapturedReply(api, params.target, polished.reply);
+
+    const mirroredReplyText = buildCapturedReplyMirrorText(polished.reply);
+    appendOriginalSessionAssistantMirror({
+      logger: api.logger,
+      mediaUrls: polished.reply.mediaUrls,
+      model: "onebot-async-final",
+      originalSessionKey: params.originalSessionKey,
+      storePath: params.storePath,
+      text: mirroredReplyText,
+      timestampMs: Date.now()
+    });
+
+    updateAsyncTaskRecord({
+      recordId: params.taskRecordId,
+      storePath: params.storePath,
+      mutate: (current) => ({
+        ...current,
+        completedAt: Date.now(),
+        finalReplyText: mirroredReplyText,
+        mediaUrls: polished.reply.mediaUrls,
+        polishSessionKey: polished.polishSessionKey,
+        status: "completed",
+        updatedAt: Date.now()
+      })
+    });
   } catch (error) {
+    const failText = buildAsyncFailureText(error);
     api.logger?.error?.(`[onebot] async dispatch failed: ${error instanceof Error ? error.message : String(error)}`);
     await sendFailureMessage(api, params.target, error, "刚才那个异步任务失败了");
+    appendOriginalSessionAssistantMirror({
+      logger: api.logger,
+      model: "onebot-async-failure",
+      originalSessionKey: params.originalSessionKey,
+      storePath: params.storePath,
+      text: failText,
+      timestampMs: Date.now()
+    });
+    updateAsyncTaskRecord({
+      recordId: params.taskRecordId,
+      storePath: params.storePath,
+      mutate: (current) => ({
+        ...current,
+        errorText: error instanceof Error ? error.message : String(error),
+        failedAt: Date.now(),
+        status: "failed",
+        updatedAt: Date.now()
+      })
+    });
   }
 }
 
@@ -931,6 +1119,28 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
       return;
     }
 
+    const originalCtxPayload = buildInboundContext(api, runtime, {
+      mediaAttachments: inboundImages,
+      messageText,
+      replyTarget,
+      sessionKey
+    });
+
+    await recordInboundSession(api, runtime, {
+      ctx: originalCtxPayload,
+      replyTarget: replyTarget.replyTarget,
+      sessionKey,
+      storePath
+    });
+    appendOriginalSessionUserMirror({
+      body: originalCtxPayload.Body,
+      fallbackText: messageText,
+      logger: api.logger,
+      originalSessionKey: sessionKey,
+      storePath,
+      timestampMs: Date.now()
+    });
+
     const triggerMeta = [
       asyncTrigger.mode,
       asyncTrigger.keyword ? `keyword=${asyncTrigger.keyword}` : "",
@@ -938,6 +1148,7 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
       typeof asyncTrigger.confidence === "number" ? `confidence=${asyncTrigger.confidence.toFixed(2)}` : ""
     ].filter(Boolean).join(" ");
     api.logger?.info?.(`[onebot] async task accepted (${triggerMeta}) ${sessionKey}`);
+    const taskSessionKey = buildAsyncSessionKey(route.agentId ?? "main", replyTarget, "task");
     const ackText = await buildAsyncAcceptedAck(api, {
       agentId: route.agentId ?? "main",
       asyncConfig,
@@ -945,9 +1156,36 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
       trigger: asyncTrigger,
       userRequestText: messageText.trim()
     });
+    const taskRecord = createAsyncTaskRecord({
+      ackText,
+      agentId: route.agentId ?? "main",
+      chatType: replyTarget.chatType,
+      groupId,
+      originalRequestText: messageText.trim(),
+      originalSessionKey: sessionKey,
+      replyTarget: replyTarget.replyTarget,
+      targetLabel: replyTarget.senderLabel,
+      taskMessageText: asyncTrigger.taskMessageText,
+      taskSessionKey,
+      trigger: toAsyncTriggerMeta(asyncTrigger),
+      userId
+    });
+    upsertAsyncTaskRecord({
+      record: taskRecord,
+      storePath
+    });
+
     await sendAsyncAcceptedReply(api, {
       ackText,
       target: replyTarget
+    });
+    appendOriginalSessionAssistantMirror({
+      logger: api.logger,
+      model: "onebot-async-ack",
+      originalSessionKey: sessionKey,
+      storePath,
+      text: ackText,
+      timestampMs: Date.now()
     });
 
     void handleDetachedAsyncReply(api, runtime, {
@@ -958,16 +1196,26 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
       originalRequestText: messageText.trim(),
       originalSessionKey: sessionKey,
       storePath,
-      target: replyTarget
+      target: replyTarget,
+      taskRecordId: taskRecord.id,
+      taskSessionKey
     });
     return;
   }
+
+  const asyncTaskContext = await resolveAsyncTaskUntrustedContext(api, {
+    asyncConfig,
+    messageText,
+    originalSessionKey: sessionKey,
+    storePath
+  });
 
   const ctxPayload = buildInboundContext(api, runtime, {
     mediaAttachments: inboundImages,
     messageText,
     replyTarget,
-    sessionKey
+    sessionKey,
+    untrustedContext: asyncTaskContext ? [asyncTaskContext] : undefined
   });
 
   await recordInboundSession(api, runtime, {

@@ -60,6 +60,7 @@ export interface OneBotAsyncReplyAiConfig {
   judgeModel: string;
   maxTokens: number;
   model?: string;
+  searchModel: string;
   temperature: number;
   timeoutMs: number;
 }
@@ -206,6 +207,11 @@ export function getAsyncReplyConfig(apiOrCfg?: any): OneBotAsyncReplyConfig {
       ackModel: resolveOptionalString(
         ai.ackModel,
         process.env.ONEBOT_ASYNC_AI_ACK_MODEL,
+        legacyModel
+      ) ?? "kimi-k2-turbo-preview",
+      searchModel: resolveOptionalString(
+        ai.searchModel,
+        process.env.ONEBOT_ASYNC_AI_SEARCH_MODEL,
         legacyModel
       ) ?? "kimi-k2-turbo-preview",
       timeoutMs: resolvePositiveInteger(ai.timeoutMs, 3500),
