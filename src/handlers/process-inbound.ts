@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 
 import { buildAgentPersonaContext } from "../agent-persona.js";
 import { generateAsyncAckWithAi } from "../async-ack-ai.js";
@@ -258,6 +258,54 @@ async function resolveAsyncTrigger(params: {
     mode: "keyword",
     taskMessageText: params.fullMessageText.trim()
   };
+}
+
+function buildOneBotSessionKey(target: ReplyTarget): string {
+  return target.isGroup ? `onebot:group:${target.groupId}` : `onebot:user:${target.userId}`;
+}
+
+function buildCanonicalSessionKey(agentId: string, target: ReplyTarget): string {
+  const normalizedAgentId = agentId.trim().toLowerCase() || "main";
+  return `agent:${normalizedAgentId}:${buildOneBotSessionKey(target)}`;
+}
+
+function migrateLegacySessionStoreKey(params: {
+  canonicalKey: string;
+  legacyKey: string;
+  logger?: { info?: (message: string) => void; warn?: (message: string) => void };
+  storePath: string;
+}): void {
+  const storePath = params.storePath.trim();
+  const canonicalKey = params.canonicalKey.trim().toLowerCase();
+  const legacyKey = params.legacyKey.trim().toLowerCase();
+  if (!storePath || !canonicalKey || !legacyKey || canonicalKey === legacyKey || !existsSync(storePath)) {
+    return;
+  }
+
+  try {
+    const raw = readFileSync(storePath, "utf8").trim();
+    if (!raw) {
+      return;
+    }
+
+    const store = JSON.parse(raw) as Record<string, unknown>;
+    if (Array.isArray(store) || !store || typeof store !== "object") {
+      return;
+    }
+
+    const legacyEntry = store[legacyKey];
+    const canonicalEntry = store[canonicalKey];
+    if (!legacyEntry || canonicalEntry) {
+      return;
+    }
+
+    store[canonicalKey] = legacyEntry;
+    delete store[legacyKey];
+    writeFileSync(storePath, `${JSON.stringify(store, null, 2)}\n`, "utf8");
+    params.logger?.info?.(`[onebot] migrated legacy session key ${legacyKey} -> ${canonicalKey}`);
+  } catch (error) {
+    params.logger?.warn?.(`[onebot] migrate legacy session key failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 function buildAsyncSessionKey(agentId: string, target: ReplyTarget, kind: "task" | "polish"): string {
@@ -822,7 +870,6 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
 
   const userId = Number(msg.user_id);
   const groupId = msg.group_id ? Number(msg.group_id) : undefined;
-  const sessionId = isGroup ? `onebot:group:${groupId}` : `onebot:user:${userId}`;
   const replyTargetValue = isGroup ? `onebot:group:${groupId}` : `onebot:user:${userId}`;
   const replyTarget: ReplyTarget = {
     chatType: isGroup ? "group" : "direct",
@@ -832,17 +879,29 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
     senderLabel: String(userId),
     userId
   };
+  const legacySessionKey = buildOneBotSessionKey(replyTarget);
 
   const route = runtime.channel.routing?.resolveAgentRoute?.({
     cfg: api.config,
-    sessionKey: sessionId,
     channel: "onebot",
-    accountId: config.accountId ?? "default"
+    accountId: config.accountId ?? "default",
+    peer: {
+      kind: isGroup ? "group" : "direct",
+      id: String(isGroup ? groupId : userId)
+    }
   }) ?? { agentId: "main" };
+  const sessionKey = buildCanonicalSessionKey(route.agentId ?? "main", replyTarget);
 
   const storePath = runtime.channel.session?.resolveStorePath?.(api.config?.session?.store, {
     agentId: route.agentId
   }) ?? "";
+
+  migrateLegacySessionStoreKey({
+    canonicalKey: sessionKey,
+    legacyKey: legacySessionKey,
+    logger: api.logger,
+    storePath
+  });
 
   if (runtime.channel.activity?.record) {
     runtime.channel.activity.record({
@@ -878,7 +937,7 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
       asyncTrigger.reason ? `reason=${asyncTrigger.reason}` : "",
       typeof asyncTrigger.confidence === "number" ? `confidence=${asyncTrigger.confidence.toFixed(2)}` : ""
     ].filter(Boolean).join(" ");
-    api.logger?.info?.(`[onebot] async task accepted (${triggerMeta}) ${sessionId}`);
+    api.logger?.info?.(`[onebot] async task accepted (${triggerMeta}) ${sessionKey}`);
     const ackText = await buildAsyncAcceptedAck(api, {
       agentId: route.agentId ?? "main",
       asyncConfig,
@@ -897,7 +956,7 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
       mediaAttachments: inboundImages,
       messageText: asyncTrigger.taskMessageText,
       originalRequestText: messageText.trim(),
-      originalSessionKey: sessionId,
+      originalSessionKey: sessionKey,
       storePath,
       target: replyTarget
     });
@@ -908,13 +967,13 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
     mediaAttachments: inboundImages,
     messageText,
     replyTarget,
-    sessionKey: sessionId
+    sessionKey
   });
 
   await recordInboundSession(api, runtime, {
     ctx: ctxPayload,
     replyTarget: replyTarget.replyTarget,
-    sessionKey: sessionId,
+    sessionKey,
     storePath
   });
 
