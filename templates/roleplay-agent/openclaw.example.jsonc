@@ -1,0 +1,43 @@
+{
+  // OneBot 渠道配置：这里只放连接参数和渠道行为，不放完整人设。
+  "channels": {
+    "onebot": {
+      "type": "forward-websocket",
+      "host": "127.0.0.1",
+      "port": 3001,
+      "accessToken": "替换成你的 OneBot access token",
+      "path": "/onebot/v11/ws",
+      "requireMention": false,
+      "renderMarkdownToPlain": true
+    }
+  },
+
+  // Agent 配置：这里决定由哪个 agent 承接 OneBot 对话。
+  "agents": {
+    "list": [
+      {
+        "id": "roleplay",
+        "name": "QQ 角色助手",
+        "workspace": "~/.openclaw/workspace-roleplay",
+        "model": {
+          "primary": "替换成你的模型 id"
+        },
+        "identity": {
+          "name": "{{角色名}}",
+          "emoji": "🦊"
+        }
+      }
+    ]
+  },
+
+  // 路由绑定：把 onebot/default 交给上面的 roleplay agent。
+  "bindings": [
+    {
+      "agentId": "roleplay",
+      "match": {
+        "channel": "onebot",
+        "accountId": "default"
+      }
+    }
+  ]
+}

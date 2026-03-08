@@ -13,6 +13,7 @@
 - 新成员入群欢迎（文本模板版）
 - `openclaw onebot setup` 交互式配置
 - repo 内置 `skills/onebot-ops`
+- `templates/roleplay-agent` 人设与绑定模板
 
 ## 安装依赖
 
@@ -95,6 +96,14 @@ openclaw message send --channel onebot --target group:987654321 --media "file://
 cp .env.example .env
 npm run test:connect
 ```
+
+## 人设模板
+
+如果你想把 OneBot 接到一个固定人设的 OpenClaw agent，参考：
+
+- `templates/roleplay-agent/README.md`
+- `templates/roleplay-agent/IDENTITY.md`
+- `templates/roleplay-agent/openclaw.example.jsonc`
 
 ## 说明
 
