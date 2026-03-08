@@ -84,10 +84,29 @@ function looksLikeAbsoluteLocalPath(value: string): boolean {
   return value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value);
 }
 
+function formatNestedError(error: unknown): string {
+  if (error instanceof AggregateError) {
+    const childMessages = Array.from(error.errors ?? []).map((item) => formatNestedError(item)).filter(Boolean);
+    if (childMessages.length > 0) {
+      return childMessages.join(" | ");
+    }
+  }
+  if (error instanceof Error) {
+    return error.message || error.name;
+  }
+  return String(error);
+}
+
 function downloadUrl(url: string): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const client = url.startsWith("https://") ? https : http;
-    const req = client.get(url, (res) => {
+    const req = client.get(url, {
+      family: 4,
+      headers: {
+        "User-Agent": "openclaw-onebot/0.1",
+        "Accept": "image/*,*/*;q=0.8"
+      }
+    }, (res) => {
       const redirect = res.statusCode && res.statusCode >= 300 && res.statusCode < 400 ? res.headers.location : undefined;
       if (redirect) {
         const nextUrl = redirect.startsWith("http") ? redirect : new URL(redirect, url).href;
@@ -95,18 +114,18 @@ function downloadUrl(url: string): Promise<Buffer> {
         return;
       }
       if (res.statusCode && res.statusCode >= 400) {
-        reject(new Error(`HTTP ${res.statusCode}`));
+        reject(new Error(`Download failed (${url}): HTTP ${res.statusCode}`));
         return;
       }
       const chunks: Buffer[] = [];
       res.on("data", (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
       res.on("end", () => resolve(Buffer.concat(chunks)));
-      res.on("error", reject);
+      res.on("error", (error) => reject(new Error(`Download failed (${url}): ${formatNestedError(error)}`)));
     });
-    req.on("error", reject);
+    req.on("error", (error) => reject(new Error(`Download failed (${url}): ${formatNestedError(error)}`)));
     req.setTimeout(30000, () => {
       req.destroy();
-      reject(new Error("Download timeout"));
+      reject(new Error(`Download failed (${url}): timeout`));
     });
   });
 }
@@ -198,7 +217,9 @@ function sendOneBotAction(socket: WebSocket, action: string, params: Record<stri
 
 function assertOk(res: any, action: string): void {
   if (!res || res.retcode !== 0) {
-    throw new Error(res?.msg ?? `OneBot ${action} failed`);
+    const reason = [res?.wording, res?.message, res?.msg].find((item) => typeof item === "string" && item.trim()) ?? "";
+    const retcode = typeof res?.retcode === "number" ? ` retcode=${res.retcode}` : "";
+    throw new Error(reason || `OneBot ${action} failed${retcode}`);
   }
 }
 
@@ -314,27 +335,71 @@ export function stopConnection(): void {
   resetReadyPromise();
 }
 
-export async function sendPrivateMsg(userId: number, text: string, getConfig?: () => OneBotAccountConfig | null): Promise<number | undefined> {
+type OneBotOutboundMessage = string | OneBotMessageSegment[];
+
+function buildInvalidImageFallbackText(segment: OneBotMessageSegment): string {
+  const summary = typeof segment.data?.summary === "string" ? segment.data.summary.trim() : "";
+  return summary || "[图片无效]";
+}
+
+async function normalizeOutboundMessage(message: OneBotOutboundMessage): Promise<OneBotOutboundMessage> {
+  if (typeof message === "string") {
+    return message;
+  }
+
+  const logger = getLogger();
+  const normalized: OneBotMessageSegment[] = [];
+  for (const segment of message) {
+    if (segment.type !== "image") {
+      normalized.push(segment);
+      continue;
+    }
+
+    const rawFile = typeof segment.data?.file === "string" ? segment.data.file.trim() : "";
+    if (!rawFile) {
+      normalized.push({ type: "text", data: { text: buildInvalidImageFallbackText(segment) } });
+      logger.warn?.("[onebot] outbound image skipped: empty file reference");
+      continue;
+    }
+
+    try {
+      const normalizedFile = await resolveImageToLocalPath(rawFile);
+      normalized.push({
+        ...segment,
+        data: {
+          ...(segment.data ?? {}),
+          file: normalizedFile
+        }
+      });
+    } catch (error) {
+      logger.warn?.(`[onebot] outbound image fallback: ${formatNestedError(error)} source=${rawFile.slice(0, 200)}`);
+      normalized.push({ type: "text", data: { text: buildInvalidImageFallbackText(segment) } });
+    }
+  }
+
+  return normalized;
+}
+
+async function sendMessage(action: "send_private_msg" | "send_group_msg", params: { user_id?: number; group_id?: number }, message: OneBotOutboundMessage, getConfig?: () => OneBotAccountConfig | null): Promise<number | undefined> {
   const socket = getConfig ? await ensureConnection(getConfig) : await waitForConnection();
-  const res = await sendOneBotAction(socket, "send_private_msg", { user_id: userId, message: text });
-  assertOk(res, "send_private_msg");
+  const res = await sendOneBotAction(socket, action, {
+    ...params,
+    message: await normalizeOutboundMessage(message)
+  });
+  assertOk(res, action);
   return res?.data?.message_id as number | undefined;
 }
 
-export async function sendGroupMsg(groupId: number, text: string, getConfig?: () => OneBotAccountConfig | null): Promise<number | undefined> {
-  const socket = getConfig ? await ensureConnection(getConfig) : await waitForConnection();
-  const res = await sendOneBotAction(socket, "send_group_msg", { group_id: groupId, message: text });
-  assertOk(res, "send_group_msg");
-  return res?.data?.message_id as number | undefined;
+export async function sendPrivateMsg(userId: number, message: OneBotOutboundMessage, getConfig?: () => OneBotAccountConfig | null): Promise<number | undefined> {
+  return sendMessage("send_private_msg", { user_id: userId }, message, getConfig);
+}
+
+export async function sendGroupMsg(groupId: number, message: OneBotOutboundMessage, getConfig?: () => OneBotAccountConfig | null): Promise<number | undefined> {
+  return sendMessage("send_group_msg", { group_id: groupId }, message, getConfig);
 }
 
 async function sendImageMessage(action: "send_private_msg" | "send_group_msg", params: { user_id?: number; group_id?: number }, image: string, getConfig?: () => OneBotAccountConfig | null): Promise<number | undefined> {
-  const socket = getConfig ? await ensureConnection(getConfig) : await waitForConnection();
-  const file = await resolveImageToLocalPath(image);
-  const message: OneBotMessageSegment[] = [{ type: "image", data: { file } }];
-  const res = await sendOneBotAction(socket, action, { ...params, message });
-  assertOk(res, action);
-  return res?.data?.message_id as number | undefined;
+  return sendMessage(action, params, [{ type: "image", data: { file: image } }], getConfig);
 }
 
 export async function sendPrivateImage(userId: number, image: string, getConfig?: () => OneBotAccountConfig | null): Promise<number | undefined> {

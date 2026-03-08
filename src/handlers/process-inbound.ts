@@ -15,12 +15,12 @@ import {
 } from "../async-task-records.js";
 import { getAsyncReplyConfig, getGroupIncreaseConfig, getOneBotConfig, getRenderMarkdownToPlain, getRequireMention, type OneBotAsyncReplyConfig } from "../config.js";
 import { classifyAsyncIntentWithAi } from "../async-intent-ai.js";
-import { getImage, getMsg, sendGroupImage, sendGroupMsg, sendPrivateImage, sendPrivateMsg, stageInboundImageToLocalPath } from "../connection.js";
+import { getImage, getMsg, sendGroupMsg, sendPrivateMsg, stageInboundImageToLocalPath } from "../connection.js";
 import { collapseDoubleNewlines, markdownToPlain } from "../markdown.js";
 import { appendSessionAssistantMessage, appendSessionUserMessage } from "../session-transcript-mirror.js";
 import { getImageSegments, getRawText, getReplyMessageId, getTextFromMessageContent, getTextFromSegments, isMentioned } from "../message.js";
 import { clearActiveReplyTarget, setActiveReplyTarget } from "../reply-context.js";
-import type { OneBotMessage } from "../types.js";
+import type { OneBotMessage, OneBotMessageSegment } from "../types.js";
 import { handleGroupIncrease } from "./group-increase.js";
 
 type ReplyPayload = { text?: string; body?: string; mediaUrl?: string; mediaUrls?: string[] } | string;
@@ -39,7 +39,12 @@ type InboundImageAttachment = {
   path: string;
 };
 
+type CapturedReplyPart =
+  | { type: "text"; text: string }
+  | { type: "image"; mediaUrl: string };
+
 type CapturedReply = {
+  parts: CapturedReplyPart[];
   textParts: string[];
   mediaUrls: string[];
 };
@@ -588,47 +593,136 @@ function normalizeReplyText(api: any, text: string): string {
   return finalText ? collapseDoubleNewlines(finalText) : "";
 }
 
-function appendCapturedReply(api: any, capture: CapturedReply, payload: ReplyPayload): void {
-  const parsed = payload as { text?: string; body?: string; mediaUrl?: string; mediaUrls?: string[] } | string;
-  const rawText = typeof parsed === "string" ? parsed : parsed?.text ?? parsed?.body ?? "";
-  const mediaUrls = typeof parsed === "string"
-    ? []
-    : [parsed?.mediaUrl, ...(parsed?.mediaUrls ?? [])].filter((item): item is string => typeof item === "string" && item.trim().length > 0);
-  const trimmedText = rawText.trim();
+function formatNestedError(error: unknown): string {
+  if (error instanceof AggregateError) {
+    const childMessages = Array.from(error.errors ?? []).map((item) => formatNestedError(item)).filter(Boolean);
+    if (childMessages.length > 0) {
+      return `AggregateError: ${childMessages.join(" | ")}`;
+    }
+  }
+  if (error instanceof Error) {
+    return error.message || error.name;
+  }
+  return String(error);
+}
 
-  if (trimmedText && trimmedText !== "NO_REPLY" && !trimmedText.endsWith("NO_REPLY")) {
-    const normalizedText = normalizeReplyText(api, trimmedText);
-    if (normalizedText) {
-      capture.textParts.push(normalizedText);
+function extractQqImgParts(text: string): CapturedReplyPart[] {
+  const parts: CapturedReplyPart[] = [];
+  const pattern = /<qqimg>\s*([\s\S]*?)\s*<\/(?:qqimg|img)>/gi;
+  let cursor = 0;
+
+  for (const match of text.matchAll(pattern)) {
+    const matchIndex = match.index ?? 0;
+    const leadingText = text.slice(cursor, matchIndex);
+    if (leadingText) {
+      parts.push({ type: "text", text: leadingText });
+    }
+
+    const mediaUrl = (match[1] ?? "").trim();
+    if (mediaUrl) {
+      parts.push({ type: "image", mediaUrl });
+    }
+    cursor = matchIndex + match[0].length;
+  }
+
+  const trailingText = text.slice(cursor);
+  if (trailingText) {
+    parts.push({ type: "text", text: trailingText });
+  }
+
+  if (parts.length > 0) {
+    return parts;
+  }
+
+  return text ? [{ type: "text", text }] : [];
+}
+
+function pushCapturedTextPart(api: any, capture: CapturedReply, text: string): void {
+  const trimmedText = text.trim();
+  if (!trimmedText || trimmedText === "NO_REPLY" || trimmedText.endsWith("NO_REPLY")) {
+    return;
+  }
+
+  const normalizedText = normalizeReplyText(api, trimmedText);
+  if (!normalizedText) {
+    return;
+  }
+
+  capture.textParts.push(normalizedText);
+  const lastPart = capture.parts[capture.parts.length - 1];
+  if (lastPart?.type === "text") {
+    lastPart.text = collapseDoubleNewlines(`${lastPart.text}\n\n${normalizedText}`).trim();
+    return;
+  }
+
+  capture.parts.push({ type: "text", text: normalizedText });
+}
+
+function pushCapturedMediaUrl(capture: CapturedReply, mediaUrl: string): void {
+  const normalizedMediaUrl = mediaUrl.trim();
+  if (!normalizedMediaUrl || capture.mediaUrls.includes(normalizedMediaUrl)) {
+    return;
+  }
+
+  capture.mediaUrls.push(normalizedMediaUrl);
+  capture.parts.push({ type: "image", mediaUrl: normalizedMediaUrl });
+}
+
+function buildCapturedReplySegments(captured: CapturedReply): OneBotMessageSegment[] {
+  const segments: OneBotMessageSegment[] = [];
+
+  for (const part of captured.parts) {
+    if (part.type === "image") {
+      segments.push({ type: "image", data: { file: part.mediaUrl } });
+      continue;
+    }
+
+    const text = part.text.trim();
+    if (text) {
+      segments.push({ type: "text", data: { text } });
     }
   }
 
-  for (const mediaUrl of mediaUrls) {
-    if (!capture.mediaUrls.includes(mediaUrl)) {
-      capture.mediaUrls.push(mediaUrl);
+  return segments;
+}
+
+function appendCapturedReply(api: any, capture: CapturedReply, payload: ReplyPayload): void {
+  const parsed = payload as { text?: string; body?: string; mediaUrl?: string; mediaUrls?: string[] } | string;
+  const rawText = typeof parsed === "string" ? parsed : parsed?.text ?? parsed?.body ?? "";
+
+  for (const part of extractQqImgParts(rawText)) {
+    if (part.type === "image") {
+      pushCapturedMediaUrl(capture, part.mediaUrl);
+      continue;
+    }
+    pushCapturedTextPart(api, capture, part.text);
+  }
+
+  if (typeof parsed !== "string") {
+    for (const mediaUrl of [parsed?.mediaUrl, ...(parsed?.mediaUrls ?? [])]) {
+      if (typeof mediaUrl === "string") {
+        pushCapturedMediaUrl(capture, mediaUrl);
+      }
     }
   }
 }
 
 async function deliverCapturedReply(api: any, target: ReplyTarget, captured: CapturedReply): Promise<void> {
-  const finalText = collapseDoubleNewlines(captured.textParts.filter(Boolean).join("\n\n")).trim();
-
-  if (target.isGroup && target.groupId) {
-    if (finalText) {
-      await sendGroupMsg(target.groupId, finalText, () => getOneBotConfig(api));
-    }
-    for (const mediaUrl of captured.mediaUrls) {
-      await sendGroupImage(target.groupId, mediaUrl, () => getOneBotConfig(api));
-    }
+  const message = buildCapturedReplySegments(captured);
+  if (message.length === 0) {
     return;
   }
 
-  if (finalText) {
-    await sendPrivateMsg(target.userId, finalText, () => getOneBotConfig(api));
+  const outbound = message.length === 1 && message[0]?.type === "text"
+    ? String(message[0].data?.text ?? "")
+    : message;
+
+  if (target.isGroup && target.groupId) {
+    await sendGroupMsg(target.groupId, outbound, () => getOneBotConfig(api));
+    return;
   }
-  for (const mediaUrl of captured.mediaUrls) {
-    await sendPrivateImage(target.userId, mediaUrl, () => getOneBotConfig(api));
-  }
+
+  await sendPrivateMsg(target.userId, outbound, () => getOneBotConfig(api));
 }
 
 async function sendFailureMessage(api: any, target: ReplyTarget, error: unknown, prefix = "处理失败"): Promise<void> {
@@ -653,12 +747,12 @@ async function dispatchReply(api: any, runtime: any, params: {
       cfg: api.config,
       dispatcherOptions: {
         deliver: async (payload: unknown) => {
-          const captured: CapturedReply = { textParts: [], mediaUrls: [] };
+          const captured: CapturedReply = { parts: [], textParts: [], mediaUrls: [] };
           appendCapturedReply(api, captured, payload as ReplyPayload);
           await deliverCapturedReply(api, params.target, captured);
         },
         onError: async (error: unknown, info: { kind?: string }) => {
-          api.logger?.error?.(`[onebot] ${info?.kind ?? "reply"} failed: ${String(error)}`);
+          api.logger?.error?.(`[onebot] ${info?.kind ?? "reply"} failed: ${formatNestedError(error)}`);
         }
       },
       replyOptions: {
@@ -672,6 +766,7 @@ async function dispatchReply(api: any, runtime: any, params: {
 
 async function captureReply(api: any, runtime: any, ctx: Record<string, unknown>): Promise<CapturedReply> {
   const captured: CapturedReply = {
+    parts: [],
     textParts: [],
     mediaUrls: []
   };
@@ -684,7 +779,7 @@ async function captureReply(api: any, runtime: any, ctx: Record<string, unknown>
         appendCapturedReply(api, captured, payload as ReplyPayload);
       },
       onError: async (error: unknown, info: { kind?: string }) => {
-        api.logger?.error?.(`[onebot] ${info?.kind ?? "reply"} failed: ${String(error)}`);
+        api.logger?.error?.(`[onebot] ${info?.kind ?? "reply"} failed: ${formatNestedError(error)}`);
       }
     },
     replyOptions: {
@@ -1218,14 +1313,16 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
       sessionKey,
       storePath
     });
-    await appendOriginalSessionUserMirrorWithRetry({
-      body: originalCtxPayload.Body,
-      fallbackText: messageText,
-      logger: api.logger,
-      originalSessionKey: sessionKey,
-      storePath,
-      timestampMs: Date.now()
-    });
+    if (asyncConfig.spawnTaskSession) {
+      await appendOriginalSessionUserMirrorWithRetry({
+        body: originalCtxPayload.Body,
+        fallbackText: messageText,
+        logger: api.logger,
+        originalSessionKey: sessionKey,
+        storePath,
+        timestampMs: Date.now()
+      });
+    }
 
     const triggerMeta = [
       asyncTrigger.mode,
@@ -1234,27 +1331,6 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
       typeof asyncTrigger.confidence === "number" ? `confidence=${asyncTrigger.confidence.toFixed(2)}` : ""
     ].filter(Boolean).join(" ");
     api.logger?.info?.(`[onebot] async task accepted (${triggerMeta}) ${sessionKey}`);
-    const ackText = await buildAsyncAcceptedAck(api, {
-      agentId: route.agentId ?? "main",
-      asyncConfig,
-      chatType: replyTarget.chatType,
-      trigger: asyncTrigger,
-      userRequestText: messageText.trim()
-    });
-
-    await sendAsyncAcceptedReply(api, {
-      ackText,
-      target: replyTarget
-    });
-    await appendOriginalSessionAssistantMirrorWithRetry({
-      logger: api.logger,
-      model: "onebot-async-ack",
-      originalSessionKey: sessionKey,
-      storePath,
-      text: ackText,
-      timestampMs: Date.now()
-    });
-
     if (!asyncConfig.spawnTaskSession) {
       const inlineCtxPayload = buildInboundContext(api, runtime, {
         mediaAttachments: inboundImages,
@@ -1262,7 +1338,7 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
         replyTarget,
         sessionKey
       });
-      api.logger?.info?.(`[onebot] async child session disabled; continue on original session ${sessionKey}`);
+      api.logger?.info?.(`[onebot] async child session disabled; continue on original session without ack ${sessionKey}`);
       void (async () => {
         try {
           await dispatchReply(api, runtime, {
@@ -1285,6 +1361,27 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
       })();
       return;
     }
+
+    const ackText = await buildAsyncAcceptedAck(api, {
+      agentId: route.agentId ?? "main",
+      asyncConfig,
+      chatType: replyTarget.chatType,
+      trigger: asyncTrigger,
+      userRequestText: messageText.trim()
+    });
+
+    await sendAsyncAcceptedReply(api, {
+      ackText,
+      target: replyTarget
+    });
+    await appendOriginalSessionAssistantMirrorWithRetry({
+      logger: api.logger,
+      model: "onebot-async-ack",
+      originalSessionKey: sessionKey,
+      storePath,
+      text: ackText,
+      timestampMs: Date.now()
+    });
 
     const asyncTaskHistoryContext = buildAsyncTaskHistoryContextBlock({
       sessionKey,

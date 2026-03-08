@@ -108,8 +108,8 @@ npm run test:connect
 
 行为分两种：
 
-- 无论哪种模式，插件都会先立即回一条简短确认
-- 当 `asyncReply.spawnTaskSession=false` 时，会先发送即时确认，再继续在原主会话里完成后续回复；不会创建子 session，也不会启用异步任务记录检索
+- 当 `asyncReply.spawnTaskSession=false` 时，会直接在原主会话里继续处理，不发送即时确认；不会创建子 session，也不会启用异步任务记录检索
+- 当 `asyncReply.spawnTaskSession=true` 时，才会先回一条简短确认
 - 当 `asyncReply.spawnTaskSession=true` 时，才会把任务放到一个独立后台会话里处理
 - 开启子 session 后，原来的群/私聊主会话不会被这个长任务卡住
 - 开启子 session 后，后台拿到原始结果后，还会再结合最近对话上下文做一轮润色
@@ -153,7 +153,7 @@ npm run test:connect
 说明：
 
 - 现在默认会优先启用 AI 快速判定；如果没配 API Key 或请求失败，会回退到关键词判定
-- `asyncReply.spawnTaskSession` 默认是 `false`；默认会先发即时确认，再在原主会话里继续完成这次回复，但不会拉起后台子 session
+- `asyncReply.spawnTaskSession` 默认是 `false`；默认不会发即时确认，而是直接在原主会话里继续完成这次回复
 - 只有把 `asyncReply.spawnTaskSession=true` 打开后，才会启用完整的异步子 session、结果回填和异步记录检索链路
 - 默认会分别读取 `ai.judgeModel`、`ai.ackModel` 和 `ai.searchModel`；若没配，会向后兼容旧的 `ai.model`
 - 示例里的长任务判定模型和即时应答模型都使用 `kimi-k2.5`；异步记录检索模型仍是 `kimi-k2-turbo-preview`

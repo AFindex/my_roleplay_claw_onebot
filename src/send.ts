@@ -1,5 +1,5 @@
 import { getRenderMarkdownToPlain } from "./config.js";
-import { sendGroupImage, sendGroupMsg, sendPrivateImage, sendPrivateMsg } from "./connection.js";
+import { sendGroupMsg, sendPrivateMsg } from "./connection.js";
 import { collapseDoubleNewlines, markdownToPlain } from "./markdown.js";
 import { resolveTargetForReply } from "./reply-context.js";
 import type { OneBotAccountConfig } from "./types.js";
@@ -64,17 +64,15 @@ export async function sendMediaMessage(to: string, mediaUrl: string, text?: stri
     return { ok: false, error: "No mediaUrl provided" };
   }
   try {
-    let messageId: number | undefined;
     const normalizedText = text?.trim() ? normalizeText(text, cfg) : "";
-    if (normalizedText) {
-      messageId = target.type === "group"
-        ? await sendGroupMsg(target.id, normalizedText, getConfig)
-        : await sendPrivateMsg(target.id, normalizedText, getConfig);
-    }
-    const mediaMessageId = target.type === "group"
-      ? await sendGroupImage(target.id, mediaUrl, getConfig)
-      : await sendPrivateImage(target.id, mediaUrl, getConfig);
-    return { ok: true, messageId: String(mediaMessageId ?? messageId ?? "") };
+    const message = [
+      ...(normalizedText ? [{ type: "text", data: { text: normalizedText } }] : []),
+      { type: "image", data: { file: mediaUrl.trim() } }
+    ];
+    const messageId = target.type === "group"
+      ? await sendGroupMsg(target.id, message, getConfig)
+      : await sendPrivateMsg(target.id, message, getConfig);
+    return { ok: true, messageId: String(messageId ?? "") };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
