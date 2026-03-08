@@ -123,7 +123,7 @@ function buildRequestBody(params: {
 }): Record<string, unknown> {
   return {
     model: params.apiConfig.judgeModel,
-    ...(params.includeThinkingOff ? { thinking: "off" } : {}),
+    ...buildThinkingPayload(params.apiConfig.judgeModel, params.includeThinkingOff),
     temperature: params.apiConfig.temperature,
     max_tokens: params.apiConfig.maxTokens,
     response_format: { type: "json_object" },
@@ -155,6 +155,28 @@ function shouldRetryWithoutThinking(status: number, responseText: string): boole
     .some((keyword) => normalized.includes(keyword));
 }
 
+function usesKimi25ThinkingConfig(model: string): boolean {
+  const normalized = model.trim().toLowerCase();
+  return normalized === "kimi-k2.5" || normalized.startsWith("kimi-k2.5-");
+}
+
+function buildThinkingPayload(model: string, includeThinkingOff: boolean): Record<string, unknown> {
+  if (!includeThinkingOff) {
+    return {};
+  }
+  if (usesKimi25ThinkingConfig(model)) {
+    return { thinking: { type: "disabled" } };
+  }
+  return { thinking: "off" };
+}
+
+function describeThinkingPayload(model: string, includeThinkingOff: boolean): string {
+  if (!includeThinkingOff) {
+    return "omitted";
+  }
+  return usesKimi25ThinkingConfig(model) ? "disabled-object" : "off-string";
+}
+
 async function requestClassifier(params: {
   apiConfig: OneBotAsyncReplyAiConfig;
   chatType: "group" | "direct";
@@ -176,7 +198,9 @@ async function requestClassifier(params: {
   if (!response.ok) {
     const text = await response.text().catch(() => "");
     return {
-      retryWithoutThinking: params.includeThinkingOff && shouldRetryWithoutThinking(response.status, text),
+      retryWithoutThinking: params.includeThinkingOff
+        && !usesKimi25ThinkingConfig(params.apiConfig.judgeModel)
+        && shouldRetryWithoutThinking(response.status, text),
       text: `HTTP ${response.status} ${text.slice(0, 180)}`
     };
   }
@@ -227,7 +251,8 @@ export async function classifyAsyncIntentWithAi(params: {
   const timeout = setTimeout(() => controller.abort(), params.apiConfig.timeoutMs);
 
   try {
-    params.logger?.info?.(`[onebot] async ai classifier request judgeModel=${params.apiConfig.judgeModel} timeoutMs=${params.apiConfig.timeoutMs} thinking=off preview=${JSON.stringify(preview)}`);
+    const thinkingMode = describeThinkingPayload(params.apiConfig.judgeModel, true);
+    params.logger?.info?.(`[onebot] async ai classifier request judgeModel=${params.apiConfig.judgeModel} timeoutMs=${params.apiConfig.timeoutMs} thinking=${thinkingMode} preview=${JSON.stringify(preview)}`);
     let result = await requestClassifier({
       apiConfig: params.apiConfig,
       chatType: params.chatType,
@@ -238,7 +263,7 @@ export async function classifyAsyncIntentWithAi(params: {
     });
 
     if (result.retryWithoutThinking) {
-      params.logger?.warn?.("[onebot] async ai classifier rejected `thinking: off`; retrying without thinking field");
+      params.logger?.warn?.(`[onebot] async ai classifier rejected thinking=${thinkingMode}; retrying without thinking field`);
       result = await requestClassifier({
         apiConfig: params.apiConfig,
         chatType: params.chatType,

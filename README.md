@@ -136,8 +136,8 @@ npm run test:connect
           "enabled": true,
           "baseUrl": "https://api.moonshot.cn/v1",
           "apiKey": "<YOUR_MOONSHOT_API_KEY>",
-          "judgeModel": "kimi-k2-turbo-preview",
-          "ackModel": "kimi-k2-turbo-preview",
+          "judgeModel": "kimi-k2.5",
+          "ackModel": "kimi-k2.5",
           "searchModel": "kimi-k2-turbo-preview",
           "timeoutMs": 3500,
           "maxTokens": 48,
@@ -156,7 +156,9 @@ npm run test:connect
 - `asyncReply.spawnTaskSession` 默认是 `false`；默认会先发即时确认，再在原主会话里继续完成这次回复，但不会拉起后台子 session
 - 只有把 `asyncReply.spawnTaskSession=true` 打开后，才会启用完整的异步子 session、结果回填和异步记录检索链路
 - 默认会分别读取 `ai.judgeModel`、`ai.ackModel` 和 `ai.searchModel`；若没配，会向后兼容旧的 `ai.model`
-- 当前默认判断模型、即时应答模型、异步记录检索模型都是 `kimi-k2-turbo-preview`，温度默认是 `0.6`，并且请求会显式带上 `thinking: "off"`
+- 示例里的长任务判定模型和即时应答模型都使用 `kimi-k2.5`；异步记录检索模型仍是 `kimi-k2-turbo-preview`
+- 对 `kimi-k2.5` 作为长任务判定模型或即时应答模型时，请求会按官方文档显式传 `thinking: { "type": "disabled" }`；旧模型仍兼容 `thinking: "off"`
+- 温度默认是 `0.6`
 - 如果你不想把 key 写进配置，也可以通过环境变量 `ONEBOT_ASYNC_AI_API_KEY` 或 `MOONSHOT_API_KEY` 提供
 - 也支持分别用 `ONEBOT_ASYNC_AI_JUDGE_MODEL`、`ONEBOT_ASYNC_AI_ACK_MODEL` 与 `ONEBOT_ASYNC_AI_SEARCH_MODEL` 覆盖这三个模型；旧的 `ONEBOT_ASYNC_AI_MODEL` 仍可作为兼容回退
 - `asyncReply.enabled=false` 时会关闭自动判定，但显式 `/async` 仍然可用

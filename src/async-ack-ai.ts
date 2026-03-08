@@ -67,6 +67,28 @@ function shouldRetryWithoutThinking(status: number, responseText: string): boole
     .some((keyword) => normalized.includes(keyword));
 }
 
+function usesKimi25ThinkingConfig(model: string): boolean {
+  const normalized = model.trim().toLowerCase();
+  return normalized === "kimi-k2.5" || normalized.startsWith("kimi-k2.5-");
+}
+
+function buildThinkingPayload(model: string, includeThinkingOff: boolean): Record<string, unknown> {
+  if (!includeThinkingOff) {
+    return {};
+  }
+  if (usesKimi25ThinkingConfig(model)) {
+    return { thinking: { type: "disabled" } };
+  }
+  return { thinking: "off" };
+}
+
+function describeThinkingPayload(model: string, includeThinkingOff: boolean): string {
+  if (!includeThinkingOff) {
+    return "omitted";
+  }
+  return usesKimi25ThinkingConfig(model) ? 'disabled-object' : 'off-string';
+}
+
 function buildAckSystemPrompt(params: { agentName?: string; personaPrompt: string }): string {
   return [
     `你现在要扮演${params.agentName ? `「${params.agentName}」` : "当前角色"}，并严格维持下面的人设气质：`,
@@ -132,7 +154,7 @@ async function requestAckText(params: {
     },
     body: JSON.stringify({
       model: params.apiConfig.ackModel,
-      ...(params.includeThinkingOff ? { thinking: "off" } : {}),
+      ...buildThinkingPayload(params.apiConfig.ackModel, params.includeThinkingOff),
       temperature: params.apiConfig.temperature,
       max_tokens: Math.max(ACK_MAX_TOKENS_FLOOR, Math.min(ACK_MAX_TOKENS_CAP, params.apiConfig.maxTokens)),
       messages: [
@@ -159,7 +181,9 @@ async function requestAckText(params: {
   if (!response.ok) {
     const text = await response.text().catch(() => "");
     return {
-      retryWithoutThinking: params.includeThinkingOff && shouldRetryWithoutThinking(response.status, text),
+      retryWithoutThinking: params.includeThinkingOff
+        && !usesKimi25ThinkingConfig(params.apiConfig.ackModel)
+        && shouldRetryWithoutThinking(response.status, text),
       error: `HTTP ${response.status} ${text.slice(0, 180)}`
     };
   }
@@ -192,7 +216,8 @@ export async function generateAsyncAckWithAi(params: {
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    params.logger?.info?.(`[onebot] async ack ai request ackModel=${params.apiConfig.ackModel} timeoutMs=${timeoutMs} thinking=off preview=${JSON.stringify(preview)}`);
+    const thinkingMode = describeThinkingPayload(params.apiConfig.ackModel, true);
+    params.logger?.info?.(`[onebot] async ack ai request ackModel=${params.apiConfig.ackModel} timeoutMs=${timeoutMs} thinking=${thinkingMode} preview=${JSON.stringify(preview)}`);
     let result = await requestAckText({
       agentName: params.agentName,
       apiConfig: params.apiConfig,
@@ -205,7 +230,7 @@ export async function generateAsyncAckWithAi(params: {
     });
 
     if (result.retryWithoutThinking) {
-      params.logger?.warn?.("[onebot] async ack ai rejected `thinking: off`; retrying without thinking field");
+      params.logger?.warn?.(`[onebot] async ack ai rejected thinking=${thinkingMode}; retrying without thinking field`);
       result = await requestAckText({
         agentName: params.agentName,
         apiConfig: params.apiConfig,

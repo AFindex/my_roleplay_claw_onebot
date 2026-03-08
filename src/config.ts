@@ -227,7 +227,7 @@ export function getAsyncReplyConfig(apiOrCfg?: any): OneBotAsyncReplyConfig {
         ai.judgeModel,
         process.env.ONEBOT_ASYNC_AI_JUDGE_MODEL,
         legacyModel
-      ) ?? "kimi-k2-turbo-preview",
+      ) ?? "kimi-k2.5",
       ackModel: resolveOptionalString(
         ai.ackModel,
         process.env.ONEBOT_ASYNC_AI_ACK_MODEL,
