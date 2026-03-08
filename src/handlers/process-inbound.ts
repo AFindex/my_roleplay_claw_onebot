@@ -4,9 +4,9 @@ import { buildAgentPersonaContext } from "../agent-persona.js";
 import { generateAsyncAckWithAi } from "../async-ack-ai.js";
 import { getAsyncReplyConfig, getGroupIncreaseConfig, getOneBotConfig, getRenderMarkdownToPlain, getRequireMention, type OneBotAsyncReplyConfig } from "../config.js";
 import { classifyAsyncIntentWithAi } from "../async-intent-ai.js";
-import { getMsg, sendGroupImage, sendGroupMsg, sendPrivateImage, sendPrivateMsg } from "../connection.js";
+import { getImage, getMsg, sendGroupImage, sendGroupMsg, sendPrivateImage, sendPrivateMsg, stageInboundImageToLocalPath } from "../connection.js";
 import { collapseDoubleNewlines, markdownToPlain } from "../markdown.js";
-import { getRawText, getReplyMessageId, getTextFromMessageContent, getTextFromSegments, isMentioned } from "../message.js";
+import { getImageSegments, getRawText, getReplyMessageId, getTextFromMessageContent, getTextFromSegments, isMentioned } from "../message.js";
 import { clearActiveReplyTarget, setActiveReplyTarget } from "../reply-context.js";
 import type { OneBotMessage } from "../types.js";
 import { handleGroupIncrease } from "./group-increase.js";
@@ -20,6 +20,11 @@ type ReplyTarget = {
   replyTarget: string;
   senderLabel: string;
   userId: number;
+};
+
+type InboundImageAttachment = {
+  mime: string;
+  path: string;
 };
 
 type CapturedReply = {
@@ -99,6 +104,82 @@ function previewTextForLog(text: string, maxChars = 96): string {
     return normalized;
   }
   return `${normalized.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
+}
+
+function buildImagePlaceholder(count: number): string {
+  return count > 1 ? `<media:image> (${count} images)` : "<media:image>";
+}
+
+function pickFirstString(...values: Array<unknown>): string | undefined {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  return undefined;
+}
+
+function looksLikeDirectImageReference(value: string): boolean {
+  return value.startsWith("base64://") || /^https?:\/\//i.test(value) || value.startsWith("file://") || value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value);
+}
+
+function inferImageMime(value?: string): string {
+  const normalized = value?.trim().toLowerCase() ?? "";
+  if (normalized.startsWith("image/")) {
+    return normalized;
+  }
+  if (normalized.endsWith(".png")) return "image/png";
+  if (normalized.endsWith(".jpg") || normalized.endsWith(".jpeg")) return "image/jpeg";
+  if (normalized.endsWith(".gif")) return "image/gif";
+  if (normalized.endsWith(".webp")) return "image/webp";
+  if (normalized.endsWith(".bmp")) return "image/bmp";
+  if (normalized.endsWith(".tif") || normalized.endsWith(".tiff")) return "image/tiff";
+  return "image/*";
+}
+
+async function resolveInboundImageAttachments(api: any, msg: OneBotMessage, getConfig: () => ReturnType<typeof getOneBotConfig>): Promise<InboundImageAttachment[]> {
+  const imageSegments = getImageSegments(msg);
+  if (imageSegments.length === 0) {
+    return [];
+  }
+
+  const attachments: InboundImageAttachment[] = [];
+  const seen = new Set<string>();
+  for (const segment of imageSegments) {
+    const data = segment.data ?? {};
+    let source = pickFirstString(data.url, data.src, data.path, data.local_path);
+    const fileRef = pickFirstString(data.file, data.file_id, data.image);
+
+    if (!source && fileRef) {
+      if (looksLikeDirectImageReference(fileRef)) {
+        source = fileRef;
+      } else {
+        const resolved = await getImage(fileRef, getConfig);
+        source = pickFirstString(resolved?.file, resolved?.url);
+      }
+    }
+
+    if (!source) {
+      api.logger?.warn?.(`[onebot] inbound image skipped: missing usable source (${JSON.stringify(data)})`);
+      continue;
+    }
+
+    try {
+      const stagedPath = await stageInboundImageToLocalPath(source);
+      if (seen.has(stagedPath)) {
+        continue;
+      }
+      seen.add(stagedPath);
+      attachments.push({
+        mime: inferImageMime(pickFirstString(data.mimetype, data.mime, data.contentType, source)),
+        path: stagedPath,
+      });
+    } catch (error) {
+      api.logger?.warn?.(`[onebot] inbound image staging failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  return attachments;
 }
 
 function formatJudgeMeta(parts: Array<string | null | undefined>): string {
@@ -187,11 +268,12 @@ function buildAsyncSessionKey(agentId: string, target: ReplyTarget, kind: "task"
 }
 
 function buildInboundContext(api: any, runtime: any, params: {
+  mediaAttachments?: InboundImageAttachment[];
   messageText: string;
   replyTarget: ReplyTarget;
   sessionKey: string;
 }): Record<string, unknown> {
-  const { messageText, replyTarget, sessionKey } = params;
+  const { mediaAttachments = [], messageText, replyTarget, sessionKey } = params;
   const envelopeOptions = runtime.channel.reply?.resolveEnvelopeFormatOptions?.(api.config) ?? {};
   const body = runtime.channel.reply?.formatInboundEnvelope?.({
     channel: "OneBot",
@@ -202,6 +284,9 @@ function buildInboundContext(api: any, runtime: any, params: {
     sender: { id: String(replyTarget.userId), name: replyTarget.senderLabel },
     envelope: envelopeOptions
   }) ?? { content: [{ type: "text", text: messageText }] };
+
+  const mediaPaths = mediaAttachments.length > 0 ? mediaAttachments.map((item) => item.path) : undefined;
+  const mediaTypes = mediaAttachments.length > 0 ? mediaAttachments.map((item) => item.mime) : undefined;
 
   return {
     Body: body,
@@ -218,6 +303,12 @@ function buildInboundContext(api: any, runtime: any, params: {
     Surface: "onebot",
     MessageSid: `onebot-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     Timestamp: Date.now(),
+    MediaPath: mediaPaths?.[0],
+    MediaType: mediaTypes?.[0],
+    MediaUrl: mediaPaths?.[0],
+    MediaPaths: mediaPaths,
+    MediaUrls: mediaPaths,
+    MediaTypes: mediaTypes,
     OriginatingChannel: "onebot",
     OriginatingTo: replyTarget.replyTarget,
     CommandAuthorized: true,
@@ -620,6 +711,7 @@ async function buildAsyncAcceptedAck(api: any, params: {
 async function handleDetachedAsyncReply(api: any, runtime: any, params: {
   agentId: string;
   asyncConfig: ReturnType<typeof getAsyncReplyConfig>;
+  mediaAttachments?: InboundImageAttachment[];
   messageText: string;
   originalRequestText: string;
   originalSessionKey: string;
@@ -628,6 +720,7 @@ async function handleDetachedAsyncReply(api: any, runtime: any, params: {
 }): Promise<void> {
   const asyncSessionKey = buildAsyncSessionKey(params.agentId, params.target, "task");
   const ctxPayload = buildInboundContext(api, runtime, {
+    mediaAttachments: params.mediaAttachments,
     messageText: params.messageText,
     replyTarget: params.target,
     sessionKey: asyncSessionKey
@@ -681,6 +774,9 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
     return;
   }
 
+  const imageSegments = getImageSegments(msg);
+  const inboundImages = await resolveInboundImageAttachments(api, msg, () => config);
+
   const replyId = getReplyMessageId(msg);
   let messageText: string;
   if (replyId != null) {
@@ -697,6 +793,10 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
     }
   } else {
     messageText = getRawText(msg);
+  }
+
+  if (!messageText.trim() && imageSegments.length > 0) {
+    messageText = buildImagePlaceholder(imageSegments.length);
   }
 
   if (!messageText.trim() || !msg.user_id) {
@@ -794,6 +894,7 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
     void handleDetachedAsyncReply(api, runtime, {
       agentId: route.agentId ?? "main",
       asyncConfig,
+      mediaAttachments: inboundImages,
       messageText: asyncTrigger.taskMessageText,
       originalRequestText: messageText.trim(),
       originalSessionKey: sessionId,
@@ -804,6 +905,7 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
   }
 
   const ctxPayload = buildInboundContext(api, runtime, {
+    mediaAttachments: inboundImages,
     messageText,
     replyTarget,
     sessionKey: sessionId

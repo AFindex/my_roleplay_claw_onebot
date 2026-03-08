@@ -1,13 +1,14 @@
 import { createServer } from "node:http";
 import http from "node:http";
 import https from "node:https";
-import { mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { copyFileSync, mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import WebSocket, { WebSocketServer } from "ws";
 import type { OneBotAccountConfig, OneBotMessageSegment } from "./types.js";
 
-const IMAGE_TEMP_DIR = join(tmpdir(), "my-claw-onebot");
+const OPENCLAW_STATE_DIR = (process.env.OPENCLAW_STATE_DIR ?? "").trim() || join(homedir(), ".openclaw");
+const IMAGE_TEMP_DIR = join(OPENCLAW_STATE_DIR, "media", "my-claw-onebot");
 const IMAGE_TEMP_MAX_AGE_MS = 60 * 60 * 1000;
 const IMAGE_TEMP_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
 
@@ -62,6 +63,27 @@ function cleanupImageTemp(): void {
   }
 }
 
+function nextImageTempFile(ext: string): string {
+  cleanupImageTemp();
+  mkdirSync(IMAGE_TEMP_DIR, { recursive: true });
+  return join(
+    IMAGE_TEMP_DIR,
+    `img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`
+  );
+}
+
+function inferImageExtension(value: string): string {
+  return value.match(/\.(png|jpg|jpeg|gif|webp|bmp|tiff|tif)(?:\?|$)/i)?.[1]?.toLowerCase() ?? "png";
+}
+
+function normalizeLocalPath(value: string): string {
+  return value.replace(/\\/g, "/");
+}
+
+function looksLikeAbsoluteLocalPath(value: string): boolean {
+  return value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value);
+}
+
 function downloadUrl(url: string): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const client = url.startsWith("https://") ? https : http;
@@ -98,21 +120,43 @@ async function resolveImageToLocalPath(image: string): Promise<string> {
     return value.slice(7).replace(/\\/g, "/");
   }
   if (value.startsWith("base64://")) {
-    cleanupImageTemp();
-    mkdirSync(IMAGE_TEMP_DIR, { recursive: true });
-    const fullPath = join(IMAGE_TEMP_DIR, `img-${Date.now()}.png`);
+    const fullPath = nextImageTempFile("png");
     writeFileSync(fullPath, Buffer.from(value.slice(9), "base64"));
-    return fullPath.replace(/\\/g, "/");
+    return normalizeLocalPath(fullPath);
   }
   if (/^https?:\/\//i.test(value)) {
-    cleanupImageTemp();
-    mkdirSync(IMAGE_TEMP_DIR, { recursive: true });
-    const ext = value.match(/\.(png|jpg|jpeg|gif|webp|bmp)(?:\?|$)/i)?.[1]?.toLowerCase() ?? "png";
-    const fullPath = join(IMAGE_TEMP_DIR, `img-${Date.now()}.${ext}`);
+    const ext = inferImageExtension(value);
+    const fullPath = nextImageTempFile(ext);
     writeFileSync(fullPath, await downloadUrl(value));
-    return fullPath.replace(/\\/g, "/");
+    return normalizeLocalPath(fullPath);
   }
-  return value.replace(/\\/g, "/");
+  return normalizeLocalPath(value);
+}
+
+export async function stageInboundImageToLocalPath(image: string): Promise<string> {
+  const value = image.trim();
+  if (!value) {
+    throw new Error("Empty image");
+  }
+  if (value.startsWith("base64://")) {
+    const fullPath = nextImageTempFile("png");
+    writeFileSync(fullPath, Buffer.from(value.slice(9), "base64"));
+    return normalizeLocalPath(fullPath);
+  }
+  if (/^https?:\/\//i.test(value)) {
+    const ext = inferImageExtension(value);
+    const fullPath = nextImageTempFile(ext);
+    writeFileSync(fullPath, await downloadUrl(value));
+    return normalizeLocalPath(fullPath);
+  }
+  const localPath = value.startsWith("file://") ? value.slice(7) : value;
+  if (!looksLikeAbsoluteLocalPath(localPath)) {
+    throw new Error(`Unsupported inbound image reference: ${value}`);
+  }
+  const ext = inferImageExtension(localPath);
+  const fullPath = nextImageTempFile(ext);
+  copyFileSync(localPath, fullPath);
+  return normalizeLocalPath(fullPath);
 }
 
 function setupEchoHandler(socket: WebSocket): void {
@@ -314,6 +358,24 @@ export async function getMsg(messageId: number): Promise<{ sender?: { nickname?:
   }
 }
 
+export async function getImage(file: string, getConfig?: () => OneBotAccountConfig | null): Promise<{ file?: string; filename?: string; url?: string } | null> {
+  const socket = getConfig ? await ensureConnection(getConfig) : await waitForConnection();
+  try {
+    const res = await sendOneBotAction(socket, "get_image", { file });
+    assertOk(res, "get_image");
+    if (!res?.data || typeof res.data !== "object") {
+      return null;
+    }
+    return {
+      file: typeof res.data.file === "string" ? res.data.file : undefined,
+      filename: typeof res.data.filename === "string" ? res.data.filename : undefined,
+      url: typeof res.data.url === "string" ? res.data.url : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export async function getStrangerInfo(userId: number): Promise<{ nickname: string } | null> {
   if (!ws || ws.readyState !== WebSocket.OPEN) {
     return null;
@@ -356,4 +418,3 @@ export async function getGroupInfo(groupId: number): Promise<{ group_name: strin
 export function getAvatarUrl(userId: number, size = 640): string {
   return `https://q1.qlogo.cn/g?b=qq&nk=${userId}&s=${size}`;
 }
-
