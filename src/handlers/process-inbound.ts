@@ -485,6 +485,10 @@ async function resolveAsyncTaskUntrustedContext(api: any, params: {
   originalSessionKey: string;
   storePath: string;
 }): Promise<string | undefined> {
+  if (!params.asyncConfig.spawnTaskSession) {
+    return undefined;
+  }
+
   const records = listAsyncTaskRecordsForSession({
     storePath: params.storePath,
     originalSessionKey: params.originalSessionKey,
@@ -1172,12 +1176,7 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
       asyncTrigger.reason ? `reason=${asyncTrigger.reason}` : "",
       typeof asyncTrigger.confidence === "number" ? `confidence=${asyncTrigger.confidence.toFixed(2)}` : ""
     ].filter(Boolean).join(" ");
-    const asyncTaskHistoryContext = buildAsyncTaskHistoryContextBlock({
-      sessionKey,
-      storePath
-    });
     api.logger?.info?.(`[onebot] async task accepted (${triggerMeta}) ${sessionKey}`);
-    const taskSessionKey = buildAsyncSessionKey(route.agentId ?? "main", replyTarget, "task");
     const ackText = await buildAsyncAcceptedAck(api, {
       agentId: route.agentId ?? "main",
       asyncConfig,
@@ -1185,6 +1184,56 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
       trigger: asyncTrigger,
       userRequestText: messageText.trim()
     });
+
+    await sendAsyncAcceptedReply(api, {
+      ackText,
+      target: replyTarget
+    });
+    appendOriginalSessionAssistantMirror({
+      logger: api.logger,
+      model: "onebot-async-ack",
+      originalSessionKey: sessionKey,
+      storePath,
+      text: ackText,
+      timestampMs: Date.now()
+    });
+
+    if (!asyncConfig.spawnTaskSession) {
+      const inlineCtxPayload = buildInboundContext(api, runtime, {
+        mediaAttachments: inboundImages,
+        messageText: asyncTrigger.taskMessageText,
+        replyTarget,
+        sessionKey
+      });
+      api.logger?.info?.(`[onebot] async child session disabled; continue on original session ${sessionKey}`);
+      void (async () => {
+        try {
+          await dispatchReply(api, runtime, {
+            ctx: inlineCtxPayload,
+            target: replyTarget
+          });
+        } catch (error) {
+          const failText = buildAsyncFailureText(error);
+          api.logger?.error?.(`[onebot] async dispatch failed (original session): ${error instanceof Error ? error.message : String(error)}`);
+          await sendFailureMessage(api, replyTarget, error, "刚才那个异步任务失败了");
+          appendOriginalSessionAssistantMirror({
+            logger: api.logger,
+            model: "onebot-async-failure",
+            originalSessionKey: sessionKey,
+            storePath,
+            text: failText,
+            timestampMs: Date.now()
+          });
+        }
+      })();
+      return;
+    }
+
+    const asyncTaskHistoryContext = buildAsyncTaskHistoryContextBlock({
+      sessionKey,
+      storePath
+    });
+    const taskSessionKey = buildAsyncSessionKey(route.agentId ?? "main", replyTarget, "task");
     const taskRecord = createAsyncTaskRecord({
       ackText,
       agentId: route.agentId ?? "main",
@@ -1202,19 +1251,6 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
     upsertAsyncTaskRecord({
       record: taskRecord,
       storePath
-    });
-
-    await sendAsyncAcceptedReply(api, {
-      ackText,
-      target: replyTarget
-    });
-    appendOriginalSessionAssistantMirror({
-      logger: api.logger,
-      model: "onebot-async-ack",
-      originalSessionKey: sessionKey,
-      storePath,
-      text: ackText,
-      timestampMs: Date.now()
     });
 
     void handleDetachedAsyncReply(api, runtime, {

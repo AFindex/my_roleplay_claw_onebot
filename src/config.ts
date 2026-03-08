@@ -73,6 +73,7 @@ export interface OneBotAsyncReplyConfig {
   keywords: string[];
   rawResultCharLimit: number;
   recentMessages: number;
+  spawnTaskSession: boolean;
 }
 
 function getRootConfig(apiOrCfg?: any): any {
@@ -101,6 +102,24 @@ function resolveNumber(input: unknown, fallback: number, min: number, max: numbe
     return fallback;
   }
   return Math.min(max, Math.max(min, input));
+}
+
+function resolveOptionalBoolean(fallback: boolean, ...values: unknown[]): boolean {
+  for (const value of values) {
+    if (typeof value === "boolean") {
+      return value;
+    }
+    if (typeof value === "string" && value.trim()) {
+      const normalized = value.trim().toLowerCase();
+      if (["1", "true", "yes", "on"].includes(normalized)) {
+        return true;
+      }
+      if (["0", "false", "no", "off"].includes(normalized)) {
+        return false;
+      }
+    }
+  }
+  return fallback;
 }
 
 function resolveOptionalString(...values: unknown[]): string | undefined {
@@ -194,6 +213,11 @@ export function getAsyncReplyConfig(apiOrCfg?: any): OneBotAsyncReplyConfig {
     recentMessages: resolvePositiveInteger(asyncReply.recentMessages, 6),
     contextCharLimit: resolvePositiveInteger(asyncReply.contextCharLimit, 1200),
     rawResultCharLimit: resolvePositiveInteger(asyncReply.rawResultCharLimit, 3200),
+    spawnTaskSession: resolveOptionalBoolean(
+      false,
+      asyncReply.spawnTaskSession,
+      process.env.ONEBOT_ASYNC_REPLY_SPAWN_TASK_SESSION
+    ),
     ai: {
       enabled: ai.enabled === undefined ? true : Boolean(ai.enabled),
       apiKey,
