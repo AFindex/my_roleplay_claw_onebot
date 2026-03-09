@@ -13,12 +13,14 @@ import {
   type AsyncTaskRecord,
   type AsyncTaskTriggerMeta
 } from "../async-task-records.js";
-import { getAsyncReplyConfig, getGroupIncreaseConfig, getOneBotConfig, getRenderMarkdownToPlain, getRequireMention, type OneBotAsyncReplyConfig } from "../config.js";
+import { getAsyncReplyConfig, getGroupIncreaseConfig, getGroupSummaryConfig, getOneBotConfig, getRenderMarkdownToPlain, getRequireMention, type OneBotAsyncReplyConfig, type OneBotGroupSummaryConfig, type OneBotGroupSummaryMethod } from "../config.js";
 import { classifyAsyncIntentWithAi } from "../async-intent-ai.js";
-import { getImage, getMsg, sendGroupMsg, sendPrivateMsg, stageInboundImageToLocalPath } from "../connection.js";
+import { canUseGroupSummaryAi, generateGroupSummaryWithAi } from "../group-summary-ai.js";
+import { getGroupInfo, getGroupMemberInfo, getImage, getMsg, getStrangerInfo, sendGroupMsg, sendPrivateMsg, stageInboundMediaToLocalPath } from "../connection.js";
 import { collapseDoubleNewlines, markdownToPlain } from "../markdown.js";
+import { buildOneBotCqMessageFromSegments, parseOneBotRichText, resolveOneBotMentionTarget } from "../onebot-rich-text.js";
 import { appendSessionAssistantMessage, appendSessionUserMessage } from "../session-transcript-mirror.js";
-import { getImageSegments, getRawText, getReplyMessageId, getTextFromMessageContent, getTextFromSegments, isMentioned } from "../message.js";
+import { getImageSegments, getReadableRawText, getReadableTextFromMessageContent, getReplyMessageId, getTextFromSegments, getVideoSegments, isMentioned } from "../message.js";
 import { clearActiveReplyTarget, setActiveReplyTarget } from "../reply-context.js";
 import type { OneBotMessage, OneBotMessageSegment } from "../types.js";
 import { handleGroupIncrease } from "./group-increase.js";
@@ -28,18 +30,23 @@ type ReplyPayload = { text?: string; body?: string; mediaUrl?: string; mediaUrls
 type ReplyTarget = {
   chatType: "group" | "direct";
   groupId?: number;
+  groupName?: string;
   isGroup: boolean;
   replyTarget: string;
+  senderCard?: string;
   senderLabel: string;
+  senderName: string;
   userId: number;
 };
 
-type InboundImageAttachment = {
+type InboundMediaAttachment = {
+  kind: "image" | "video";
   mime: string;
   path: string;
 };
 
 type CapturedReplyPart =
+  | { type: "mention"; target: string }
   | { type: "text"; text: string }
   | { type: "image"; mediaUrl: string };
 
@@ -57,14 +64,36 @@ type AsyncTrigger = {
   taskMessageText: string;
 };
 
+type TranscriptExcerptItem = {
+  role: "assistant" | "user";
+  text: string;
+};
+
+type GroupSummaryCommand = {
+  keywords: string[];
+  messageLimit?: number;
+  method: OneBotGroupSummaryMethod;
+  showHelp?: boolean;
+};
+
 const ASYNC_TASK_CONTEXT_CHAR_LIMIT = 6000;
 const ASYNC_TASK_CONTEXT_MESSAGES = 20;
+const GROUP_INFO_CACHE_TTL_MS = 10 * 60 * 1000;
+const groupNameCache = new Map<number, { expiresAt: number; value: string }>();
 
 const ASYNC_COMMAND_PATTERNS = [
   /^\/async(?:[\s\u3000]+|$)/i,
   /^\/异步(?:[\s\u3000]+|$)/i,
   /^异步(?:[:：\s\u3000]+|$)/i
 ];
+
+const SUMMARY_COMMAND_PATTERNS = [
+  /^\/summary(?:[\s\u3000]+([\s\S]+))?$/i,
+  /^\/群总结(?:[\s\u3000]+([\s\S]+))?$/i,
+  /^\/总结(?:[\s\u3000]+([\s\S]+))?$/i
+];
+
+const GROUP_SUMMARY_OUTPUT_CHAR_LIMIT = 1800;
 
 function parseExplicitAsyncCommand(text: string): { matched: boolean; task: string } | null {
   const trimmed = text.trim();
@@ -126,8 +155,115 @@ function previewTextForLog(text: string, maxChars = 96): string {
   return `${normalized.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
 }
 
-function buildImagePlaceholder(count: number): string {
-  return count > 1 ? `<media:image> (${count} images)` : "<media:image>";
+function normalizeSenderName(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const normalized = value.trim();
+  return normalized || undefined;
+}
+
+function formatSenderLabel(senderName: string, senderCard: string | undefined, userId: number): string {
+  const senderId = String(userId);
+  const normalizedCard = senderCard?.trim();
+  if (normalizedCard && normalizedCard !== senderName && normalizedCard !== senderId) {
+    return `${senderName} / ${normalizedCard} (${senderId})`;
+  }
+  return senderName === senderId ? senderId : `${senderName} (${senderId})`;
+}
+
+async function resolveSenderIdentity(msg: OneBotMessage): Promise<{ senderCard?: string; senderLabel: string; senderName: string }> {
+  const userId = Number(msg.user_id ?? 0);
+  const groupId = msg.group_id ? Number(msg.group_id) : undefined;
+
+  let senderName = normalizeSenderName(msg.sender?.nickname);
+  let senderCard = groupId ? normalizeSenderName(msg.sender?.card) : undefined;
+
+  if (!senderName && userId > 0) {
+    if (groupId) {
+      const memberInfo = await getGroupMemberInfo(groupId, userId);
+      senderName = normalizeSenderName(memberInfo?.nickname) ?? normalizeSenderName(memberInfo?.card);
+      senderCard = senderCard ?? normalizeSenderName(memberInfo?.card);
+    } else {
+      const strangerInfo = await getStrangerInfo(userId);
+      senderName = normalizeSenderName(strangerInfo?.nickname);
+    }
+  }
+
+  const finalSenderName = senderName ?? senderCard ?? String(userId || "未知用户");
+  const finalSenderCard = senderCard && senderCard !== finalSenderName ? senderCard : undefined;
+  return {
+    senderCard: finalSenderCard,
+    senderLabel: formatSenderLabel(finalSenderName, finalSenderCard, userId),
+    senderName: finalSenderName,
+  };
+}
+
+async function resolveGroupName(groupId: number | undefined): Promise<string | undefined> {
+  if (!groupId) {
+    return undefined;
+  }
+
+  const cached = groupNameCache.get(groupId);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.value;
+  }
+
+  const groupInfo = await getGroupInfo(groupId);
+  const groupName = normalizeSenderName(groupInfo?.group_name);
+  if (groupName) {
+    groupNameCache.set(groupId, {
+      expiresAt: Date.now() + GROUP_INFO_CACHE_TTL_MS,
+      value: groupName,
+    });
+  }
+  return groupName;
+}
+
+function buildGroupSenderContextBlock(replyTarget: ReplyTarget): string | undefined {
+  if (!replyTarget.isGroup) {
+    return undefined;
+  }
+
+  return [
+    "OneBot group sender (untrusted metadata):",
+    "```json",
+    JSON.stringify({
+      qq: String(replyTarget.userId),
+      name: replyTarget.senderName,
+      group_nickname: replyTarget.senderCard,
+      label: replyTarget.senderLabel,
+    }, null, 2),
+    "```",
+  ].join("\n");
+}
+
+function buildGroupInfoContextBlock(replyTarget: ReplyTarget): string | undefined {
+  if (!replyTarget.isGroup || !replyTarget.groupId) {
+    return undefined;
+  }
+
+  return [
+    "OneBot group info (untrusted metadata):",
+    "```json",
+    JSON.stringify({
+      group_id: String(replyTarget.groupId),
+      group_name: replyTarget.groupName,
+      conversation_label: replyTarget.replyTarget,
+    }, null, 2),
+    "```",
+  ].join("\n");
+}
+
+function buildMediaPlaceholder(params: { imageCount?: number; videoCount?: number }): string {
+  const parts: string[] = [];
+  if ((params.imageCount ?? 0) > 0) {
+    parts.push(params.imageCount === 1 ? "<media:image>" : `<media:image> (${params.imageCount} images)`);
+  }
+  if ((params.videoCount ?? 0) > 0) {
+    parts.push(params.videoCount === 1 ? "<media:video>" : `<media:video> (${params.videoCount} videos)`);
+  }
+  return parts.join("\n");
 }
 
 function pickFirstString(...values: Array<unknown>): string | undefined {
@@ -139,7 +275,7 @@ function pickFirstString(...values: Array<unknown>): string | undefined {
   return undefined;
 }
 
-function looksLikeDirectImageReference(value: string): boolean {
+function looksLikeDirectMediaReference(value: string): boolean {
   return value.startsWith("base64://") || /^https?:\/\//i.test(value) || value.startsWith("file://") || value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value);
 }
 
@@ -157,45 +293,84 @@ function inferImageMime(value?: string): string {
   return "image/*";
 }
 
-async function resolveInboundImageAttachments(api: any, msg: OneBotMessage, getConfig: () => ReturnType<typeof getOneBotConfig>): Promise<InboundImageAttachment[]> {
-  const imageSegments = getImageSegments(msg);
-  if (imageSegments.length === 0) {
+function inferVideoMime(value?: string): string {
+  const normalized = value?.trim().toLowerCase() ?? "";
+  if (normalized.startsWith("video/")) {
+    return normalized;
+  }
+  if (normalized.endsWith(".mp4")) return "video/mp4";
+  if (normalized.endsWith(".webm")) return "video/webm";
+  if (normalized.endsWith(".mov")) return "video/quicktime";
+  if (normalized.endsWith(".m4v")) return "video/x-m4v";
+  if (normalized.endsWith(".avi")) return "video/x-msvideo";
+  if (normalized.endsWith(".mkv")) return "video/x-matroska";
+  return "video/*";
+}
+
+function dedupeInboundMediaAttachments(lists: InboundMediaAttachment[][]): InboundMediaAttachment[] {
+  const merged: InboundMediaAttachment[] = [];
+  const seen = new Set<string>();
+
+  for (const list of lists) {
+    for (const attachment of list) {
+      const key = `${attachment.kind}:${attachment.path}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      merged.push(attachment);
+    }
+  }
+
+  return merged;
+}
+
+async function resolveInboundMediaAttachments(api: any, msg: OneBotMessage, getConfig: () => ReturnType<typeof getOneBotConfig>): Promise<InboundMediaAttachment[]> {
+  const mediaSegments = [
+    ...getImageSegments(msg).map((segment) => ({ kind: "image" as const, segment })),
+    ...getVideoSegments(msg).map((segment) => ({ kind: "video" as const, segment }))
+  ];
+  if (mediaSegments.length === 0) {
     return [];
   }
 
-  const attachments: InboundImageAttachment[] = [];
+  const attachments: InboundMediaAttachment[] = [];
   const seen = new Set<string>();
-  for (const segment of imageSegments) {
+  for (const item of mediaSegments) {
+    const { kind, segment } = item;
     const data = segment.data ?? {};
-    let source = pickFirstString(data.url, data.src, data.path, data.local_path);
-    const fileRef = pickFirstString(data.file, data.file_id, data.image);
+    let source = pickFirstString(data.url, data.src, data.path, data.local_path, data.file_url, data.fileUrl);
+    const fileRef = pickFirstString(data.file, data.file_id, data.image, data.video);
 
     if (!source && fileRef) {
-      if (looksLikeDirectImageReference(fileRef)) {
+      if (looksLikeDirectMediaReference(fileRef)) {
         source = fileRef;
-      } else {
+      } else if (kind === "image") {
         const resolved = await getImage(fileRef, getConfig);
         source = pickFirstString(resolved?.file, resolved?.url);
       }
     }
 
     if (!source) {
-      api.logger?.warn?.(`[onebot] inbound image skipped: missing usable source (${JSON.stringify(data)})`);
+      api.logger?.warn?.(`[onebot] inbound ${kind} skipped: missing usable source (${JSON.stringify(data)})`);
       continue;
     }
 
     try {
-      const stagedPath = await stageInboundImageToLocalPath(source);
+      const stagedPath = await stageInboundMediaToLocalPath(source, kind === "image" ? "png" : "mp4");
       if (seen.has(stagedPath)) {
         continue;
       }
       seen.add(stagedPath);
       attachments.push({
-        mime: inferImageMime(pickFirstString(data.mimetype, data.mime, data.contentType, source)),
+        kind,
+        mime: kind === "image"
+          ? inferImageMime(pickFirstString(data.mimetype, data.mime, data.contentType, source))
+          : inferVideoMime(pickFirstString(data.mimetype, data.mime, data.contentType, source)),
         path: stagedPath,
       });
     } catch (error) {
-      api.logger?.warn?.(`[onebot] inbound image staging failed: ${error instanceof Error ? error.message : String(error)}`);
+      api.logger?.warn?.(`[onebot] inbound ${kind} staging failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -336,14 +511,25 @@ function buildAsyncSessionKey(agentId: string, target: ReplyTarget, kind: "task"
 }
 
 function buildInboundContext(api: any, runtime: any, params: {
-  mediaAttachments?: InboundImageAttachment[];
+  commandText?: string;
+  mediaAttachments?: InboundMediaAttachment[];
   messageText: string;
   replyTarget: ReplyTarget;
   sessionKey: string;
   untrustedContext?: string[];
+  wasMentioned?: boolean;
 }): Record<string, unknown> {
-  const { mediaAttachments = [], messageText, replyTarget, sessionKey, untrustedContext } = params;
+  const { commandText, mediaAttachments = [], messageText, replyTarget, sessionKey, untrustedContext, wasMentioned } = params;
   const envelopeOptions = runtime.channel.reply?.resolveEnvelopeFormatOptions?.(api.config) ?? {};
+  const agentBody = replyTarget.isGroup ? `${replyTarget.senderLabel}: ${messageText}` : messageText;
+  const groupContextBlocks = [
+    buildGroupInfoContextBlock(replyTarget),
+    buildGroupSenderContextBlock(replyTarget),
+  ].filter((item): item is string => typeof item === "string" && item.trim().length > 0);
+  const mergedUntrustedContext = [
+    ...groupContextBlocks,
+    ...(Array.isArray(untrustedContext) ? untrustedContext : []),
+  ];
   const body = runtime.channel.reply?.formatInboundEnvelope?.({
     channel: "OneBot",
     from: replyTarget.senderLabel,
@@ -352,13 +538,15 @@ function buildInboundContext(api: any, runtime: any, params: {
     chatType: replyTarget.chatType,
     sender: { id: String(replyTarget.userId), name: replyTarget.senderLabel },
     envelope: envelopeOptions
-  }) ?? { content: [{ type: "text", text: messageText }] };
+  }) ?? messageText;
 
   const mediaPaths = mediaAttachments.length > 0 ? mediaAttachments.map((item) => item.path) : undefined;
   const mediaTypes = mediaAttachments.length > 0 ? mediaAttachments.map((item) => item.mime) : undefined;
 
-  return {
+  const ctxPayload = {
     Body: body,
+    BodyForAgent: agentBody,
+    CommandBody: commandText ?? messageText,
     RawBody: messageText,
     From: replyTarget.isGroup ? `onebot:group:${replyTarget.groupId}` : `onebot:user:${replyTarget.userId}`,
     To: replyTarget.replyTarget,
@@ -366,12 +554,15 @@ function buildInboundContext(api: any, runtime: any, params: {
     AccountId: getOneBotConfig(api)?.accountId ?? "default",
     ChatType: replyTarget.chatType,
     ConversationLabel: replyTarget.replyTarget,
-    SenderName: replyTarget.senderLabel,
+    GroupChannel: replyTarget.isGroup ? replyTarget.replyTarget : undefined,
+    GroupSubject: replyTarget.groupName,
+    SenderName: replyTarget.senderName,
     SenderId: String(replyTarget.userId),
     Provider: "onebot",
     Surface: "onebot",
     MessageSid: `onebot-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     Timestamp: Date.now(),
+    WasMentioned: replyTarget.isGroup ? wasMentioned === true : undefined,
     MediaPath: mediaPaths?.[0],
     MediaType: mediaTypes?.[0],
     MediaUrl: mediaPaths?.[0],
@@ -386,13 +577,21 @@ function buildInboundContext(api: any, runtime: any, params: {
       to: replyTarget.replyTarget,
       accountId: getOneBotConfig(api)?.accountId ?? "default"
     },
-    UntrustedContext: Array.isArray(untrustedContext) && untrustedContext.length > 0 ? untrustedContext : undefined,
+    UntrustedContext: mergedUntrustedContext.length > 0 ? mergedUntrustedContext : undefined,
     _onebot: {
       userId: replyTarget.userId,
       groupId: replyTarget.groupId,
-      isGroup: replyTarget.isGroup
+      groupName: replyTarget.groupName,
+      isGroup: replyTarget.isGroup,
+      sender: {
+        card: replyTarget.senderCard,
+        label: replyTarget.senderLabel,
+        name: replyTarget.senderName,
+      }
     }
   };
+
+  return runtime.channel.reply?.finalizeInboundContext?.(ctxPayload) ?? ctxPayload;
 }
 
 async function recordInboundSession(api: any, runtime: any, params: {
@@ -436,7 +635,7 @@ function toAsyncTriggerMeta(trigger: AsyncTrigger): AsyncTaskTriggerMeta {
 }
 
 function buildCapturedReplyMirrorText(captured: CapturedReply): string | undefined {
-  const finalText = collapseDoubleNewlines(captured.textParts.filter(Boolean).join("\n\n")).trim();
+  const finalText = buildCapturedReplyText(captured);
   if (finalText) {
     return finalText;
   }
@@ -444,6 +643,18 @@ function buildCapturedReplyMirrorText(captured: CapturedReply): string | undefin
     return captured.mediaUrls.length > 1 ? `（发送了 ${captured.mediaUrls.length} 个媒体）` : "（发送了 1 个媒体）";
   }
   return undefined;
+}
+
+function buildCapturedReplyText(captured: CapturedReply): string {
+  return collapseDoubleNewlines(captured.parts.map((part) => {
+    if (part.type === "text") {
+      return part.text;
+    }
+    if (part.type === "mention") {
+      return `@${part.target}`;
+    }
+    return "";
+  }).join("")).trim();
 }
 
 function appendOriginalSessionUserMirror(params: {
@@ -606,35 +817,16 @@ function formatNestedError(error: unknown): string {
   return String(error);
 }
 
-function extractQqImgParts(text: string): CapturedReplyPart[] {
-  const parts: CapturedReplyPart[] = [];
-  const pattern = /<qqimg>\s*([\s\S]*?)\s*<\/(?:qqimg|img)>/gi;
-  let cursor = 0;
-
-  for (const match of text.matchAll(pattern)) {
-    const matchIndex = match.index ?? 0;
-    const leadingText = text.slice(cursor, matchIndex);
-    if (leadingText) {
-      parts.push({ type: "text", text: leadingText });
+function extractOneBotRichParts(text: string): CapturedReplyPart[] {
+  return parseOneBotRichText(text).map((part) => {
+    if (part.type === "image") {
+      return { type: "image", mediaUrl: part.mediaUrl };
     }
-
-    const mediaUrl = (match[1] ?? "").trim();
-    if (mediaUrl) {
-      parts.push({ type: "image", mediaUrl });
+    if (part.type === "mention") {
+      return { type: "mention", target: part.target };
     }
-    cursor = matchIndex + match[0].length;
-  }
-
-  const trailingText = text.slice(cursor);
-  if (trailingText) {
-    parts.push({ type: "text", text: trailingText });
-  }
-
-  if (parts.length > 0) {
-    return parts;
-  }
-
-  return text ? [{ type: "text", text }] : [];
+    return { type: "text", text: part.text };
+  });
 }
 
 function pushCapturedTextPart(api: any, capture: CapturedReply, text: string): void {
@@ -668,12 +860,32 @@ function pushCapturedMediaUrl(capture: CapturedReply, mediaUrl: string): void {
   capture.parts.push({ type: "image", mediaUrl: normalizedMediaUrl });
 }
 
-function buildCapturedReplySegments(captured: CapturedReply): OneBotMessageSegment[] {
+function pushCapturedMention(capture: CapturedReply, target: string): void {
+  const normalizedTarget = target.trim();
+  if (!normalizedTarget) {
+    return;
+  }
+  capture.parts.push({ type: "mention", target: normalizedTarget });
+}
+
+function buildCapturedReplySegments(captured: CapturedReply, target: ReplyTarget): OneBotMessageSegment[] {
   const segments: OneBotMessageSegment[] = [];
 
   for (const part of captured.parts) {
     if (part.type === "image") {
       segments.push({ type: "image", data: { file: part.mediaUrl } });
+      continue;
+    }
+
+    if (part.type === "mention") {
+      const mentionTarget = target.isGroup
+        ? resolveOneBotMentionTarget(part.target, target.userId)
+        : null;
+      if (mentionTarget) {
+        segments.push({ type: "at", data: { qq: mentionTarget } });
+      } else {
+        segments.push({ type: "text", data: { text: `@${part.target}` } });
+      }
       continue;
     }
 
@@ -690,9 +902,13 @@ function appendCapturedReply(api: any, capture: CapturedReply, payload: ReplyPay
   const parsed = payload as { text?: string; body?: string; mediaUrl?: string; mediaUrls?: string[] } | string;
   const rawText = typeof parsed === "string" ? parsed : parsed?.text ?? parsed?.body ?? "";
 
-  for (const part of extractQqImgParts(rawText)) {
+  for (const part of extractOneBotRichParts(rawText)) {
     if (part.type === "image") {
       pushCapturedMediaUrl(capture, part.mediaUrl);
+      continue;
+    }
+    if (part.type === "mention") {
+      pushCapturedMention(capture, part.target);
       continue;
     }
     pushCapturedTextPart(api, capture, part.text);
@@ -708,14 +924,18 @@ function appendCapturedReply(api: any, capture: CapturedReply, payload: ReplyPay
 }
 
 async function deliverCapturedReply(api: any, target: ReplyTarget, captured: CapturedReply): Promise<void> {
-  const message = buildCapturedReplySegments(captured);
+  const message = buildCapturedReplySegments(captured, target);
   if (message.length === 0) {
     return;
   }
 
-  const outbound = message.length === 1 && message[0]?.type === "text"
-    ? String(message[0].data?.text ?? "")
-    : message;
+  const cqMessage = target.isGroup
+    ? buildOneBotCqMessageFromSegments(message)
+    : null;
+  const outbound = cqMessage
+    ?? (message.length === 1 && message[0]?.type === "text"
+      ? String(message[0].data?.text ?? "")
+      : message);
 
   if (target.isGroup && target.groupId) {
     await sendGroupMsg(target.groupId, outbound, () => getOneBotConfig(api));
@@ -844,21 +1064,21 @@ function readSessionStoreEntry(storePath: string, sessionKey: string): Record<st
   }
 }
 
-function readRecentConversationExcerpt(params: {
-  contextCharLimit: number;
+function readTranscriptExcerptItems(params: {
   recentMessages: number;
   sessionKey: string;
+  stopAtLastAssistant?: boolean;
   storePath: string;
-}): string {
+}): TranscriptExcerptItem[] {
   const entry = readSessionStoreEntry(params.storePath, params.sessionKey);
   const sessionFile = typeof entry?.sessionFile === "string" ? entry.sessionFile : "";
   if (!sessionFile || !existsSync(sessionFile)) {
-    return "";
+    return [];
   }
 
   try {
     const lines = readFileSync(sessionFile, "utf8").split(/\r?\n/);
-    const collected: Array<{ role: "user" | "assistant"; text: string }> = [];
+    const collected: TranscriptExcerptItem[] = [];
 
     for (let index = lines.length - 1; index >= 0; index -= 1) {
       const line = lines[index]?.trim();
@@ -882,6 +1102,10 @@ function readRecentConversationExcerpt(params: {
           continue;
         }
 
+        if (params.stopAtLastAssistant && role === "assistant") {
+          break;
+        }
+
         const text = extractContentText(event.message?.content);
         if (!text) {
           continue;
@@ -899,19 +1123,209 @@ function readRecentConversationExcerpt(params: {
       }
     }
 
-    if (collected.length === 0) {
-      return "";
-    }
-
-    const excerpt = collected
-      .reverse()
-      .map((item) => `${item.role === "user" ? "用户" : "助手"}：${item.text}`)
-      .join("\n");
-
-    return clipText(excerpt, params.contextCharLimit);
+    return collected.reverse();
   } catch {
+    return [];
+  }
+}
+
+function buildConversationExcerptText(items: TranscriptExcerptItem[], contextCharLimit: number): string {
+  if (items.length === 0) {
     return "";
   }
+
+  const excerpt = items
+    .map((item) => `${item.role === "user" ? "用户" : "助手"}：${item.text}`)
+    .join("\n");
+
+  return clipText(excerpt, contextCharLimit);
+}
+
+function readRecentConversationExcerpt(params: {
+  contextCharLimit: number;
+  recentMessages: number;
+  sessionKey: string;
+  storePath: string;
+}): string {
+  return buildConversationExcerptText(
+    readTranscriptExcerptItems({
+      recentMessages: params.recentMessages,
+      sessionKey: params.sessionKey,
+      storePath: params.storePath
+    }),
+    params.contextCharLimit
+  );
+}
+
+function parseSummaryMessageLimit(raw: string | undefined): number | undefined {
+  if (!raw) {
+    return undefined;
+  }
+  const match = raw.trim().match(/^(\d{1,4})$/);
+  if (!match) {
+    return undefined;
+  }
+  const parsed = Number(match[1]);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return undefined;
+  }
+  return Math.min(500, Math.trunc(parsed));
+}
+
+function splitSummaryKeywords(raw: string): string[] {
+  return raw
+    .split(/[\s,，、；;|]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function parseGroupSummaryCommand(text: string, defaultMethod: OneBotGroupSummaryMethod): GroupSummaryCommand | null {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  let args = "";
+  let matched = false;
+  for (const pattern of SUMMARY_COMMAND_PATTERNS) {
+    const match = trimmed.match(pattern);
+    if (!match) {
+      continue;
+    }
+    args = (match[1] ?? "").trim();
+    matched = true;
+    break;
+  }
+
+  if (!matched) {
+    return null;
+  }
+
+  if (!args) {
+    return { keywords: [], method: defaultMethod };
+  }
+
+  if (/^(help|帮助|说明)$/i.test(args)) {
+    return { keywords: [], method: defaultMethod, showHelp: true };
+  }
+
+  const recentMatch = args.match(/^(?:recent|recent-messages|最近)(?:[\s　]+(\d{1,4}))?$/i);
+  if (recentMatch) {
+    return {
+      keywords: [],
+      messageLimit: parseSummaryMessageLimit(recentMatch[1]),
+      method: "recent-messages"
+    };
+  }
+
+  if (/^(?:since|since-last-reply|未读|自上次回复(?:以来)?|上次回复以来)$/i.test(args)) {
+    return { keywords: [], method: "since-last-reply" };
+  }
+
+  const topicMatch = args.match(/^(?:topic|关键词|聚焦)(?:[:：\s　]+)([\s\S]+)$/i);
+  if (topicMatch) {
+    return {
+      keywords: splitSummaryKeywords(topicMatch[1] ?? ""),
+      method: "focused-keywords"
+    };
+  }
+
+  const messageLimit = parseSummaryMessageLimit(args);
+  if (messageLimit) {
+    return {
+      keywords: [],
+      messageLimit,
+      method: "recent-messages"
+    };
+  }
+
+  return {
+    keywords: splitSummaryKeywords(args),
+    method: "focused-keywords"
+  };
+}
+
+function buildGroupSummaryHelpText(): string {
+  return [
+    "群总结命令用法：",
+    "- /summary",
+    "- /summary recent 50",
+    "- /summary since-last-reply",
+    "- /summary topic 发布 回滚",
+    "- /群总结",
+    "- /群总结 帮助"
+  ].join("\n");
+}
+
+function buildGroupSummaryDisabledText(): string {
+  return "群总结功能还没启用。先在 channels.onebot.groupSummary 里开启并配置 AI 吧。";
+}
+
+function buildGroupSummaryConfigMissingText(): string {
+  return "群总结 AI 还没配好：请检查 channels.onebot.groupSummary.ai.apiKey / model / enabled。";
+}
+
+function matchesSummaryKeyword(text: string, keywords: string[]): boolean {
+  const normalizedText = text.trim().toLowerCase();
+  if (!normalizedText) {
+    return false;
+  }
+  return keywords.some((keyword) => normalizedText.includes(keyword.trim().toLowerCase()));
+}
+
+function selectGroupSummarySource(params: {
+  command: GroupSummaryCommand;
+  config: OneBotGroupSummaryConfig;
+  sessionKey: string;
+  storePath: string;
+}): { emptyReason?: string; focusKeywords: string[]; scopeLabel: string; transcriptText: string } {
+  const messageLimit = params.command.messageLimit ?? params.config.recentMessages;
+
+  if (params.command.method === "since-last-reply") {
+    const items = readTranscriptExcerptItems({
+      recentMessages: Math.max(messageLimit * 3, messageLimit),
+      sessionKey: params.sessionKey,
+      stopAtLastAssistant: true,
+      storePath: params.storePath
+    });
+    const transcriptText = buildConversationExcerptText(items.slice(-messageLimit), params.config.contextCharLimit);
+    return transcriptText
+      ? { focusKeywords: [], scopeLabel: "自上次回复以来", transcriptText }
+      : { emptyReason: "从我上次说话到现在，暂时还没有新的群聊内容可总结。", focusKeywords: [], scopeLabel: "自上次回复以来", transcriptText: "" };
+  }
+
+  if (params.command.method === "focused-keywords") {
+    const focusKeywords = params.command.keywords.length > 0 ? params.command.keywords : params.config.focusKeywords;
+    if (focusKeywords.length === 0) {
+      return {
+        emptyReason: "关键词总结需要给我关键词，比如 `/summary topic 发布 回滚`。",
+        focusKeywords: [],
+        scopeLabel: "关键词聚焦",
+        transcriptText: ""
+      };
+    }
+
+    const scannedItems = readTranscriptExcerptItems({
+      recentMessages: Math.max(messageLimit * 4, messageLimit),
+      sessionKey: params.sessionKey,
+      storePath: params.storePath
+    });
+    const filteredItems = scannedItems.filter((item) => matchesSummaryKeyword(item.text, focusKeywords));
+    const transcriptText = buildConversationExcerptText(filteredItems.slice(-messageLimit), params.config.contextCharLimit);
+    return transcriptText
+      ? { focusKeywords, scopeLabel: `关键词：${focusKeywords.join("、")}`, transcriptText }
+      : { emptyReason: `最近没有找到和关键词「${focusKeywords.join("、")}」直接相关的群聊记录。`, focusKeywords, scopeLabel: `关键词：${focusKeywords.join("、")}`, transcriptText: "" };
+  }
+
+  const items = readTranscriptExcerptItems({
+    recentMessages: messageLimit,
+    sessionKey: params.sessionKey,
+    storePath: params.storePath
+  });
+  const transcriptText = buildConversationExcerptText(items, params.config.contextCharLimit);
+  return transcriptText
+    ? { focusKeywords: [], scopeLabel: `最近 ${messageLimit} 条消息`, transcriptText }
+    : { emptyReason: "当前会话里还没有足够的群聊记录可总结。", focusKeywords: [], scopeLabel: `最近 ${messageLimit} 条消息`, transcriptText: "" };
 }
 
 function buildAsyncTaskHistoryContextBlock(params: {
@@ -984,7 +1398,7 @@ async function buildPolishedAsyncReply(api: any, runtime: any, params: {
     storePath: params.storePath
   });
 
-  const rawReplyText = clipText(params.rawReply.textParts.filter(Boolean).join("\n\n"), params.asyncConfig.rawResultCharLimit);
+  const rawReplyText = clipText(buildCapturedReplyText(params.rawReply), params.asyncConfig.rawResultCharLimit);
   const polishPrompt = buildPolishPrompt({
     contextExcerpt,
     hadMedia: params.rawReply.mediaUrls.length > 0,
@@ -1012,7 +1426,7 @@ async function buildPolishedAsyncReply(api: any, runtime: any, params: {
 
   return {
     polishSessionKey,
-    reply: polished.textParts.length > 0 || polished.mediaUrls.length > 0
+    reply: buildCapturedReplyText(polished) || polished.mediaUrls.length > 0
       ? polished
       : params.rawReply
   };
@@ -1058,7 +1472,7 @@ async function buildAsyncAcceptedAck(api: any, params: {
 async function handleDetachedAsyncReply(api: any, runtime: any, params: {
   agentId: string;
   asyncConfig: ReturnType<typeof getAsyncReplyConfig>;
-  mediaAttachments?: InboundImageAttachment[];
+  mediaAttachments?: InboundMediaAttachment[];
   messageText: string;
   originalRequestText: string;
   originalSessionKey: string;
@@ -1096,7 +1510,7 @@ async function handleDetachedAsyncReply(api: any, runtime: any, params: {
 
   try {
     const rawReply = await captureReply(api, runtime, ctxPayload);
-    if (rawReply.textParts.length === 0 && rawReply.mediaUrls.length === 0) {
+    if (!buildCapturedReplyText(rawReply) && rawReply.mediaUrls.length === 0) {
       updateAsyncTaskRecord({
         recordId: params.taskRecordId,
         storePath: params.storePath,
@@ -1173,6 +1587,90 @@ async function handleDetachedAsyncReply(api: any, runtime: any, params: {
   }
 }
 
+
+async function handleGroupSummaryCommand(api: any, runtime: any, params: {
+  messageText: string;
+  replyTarget: ReplyTarget;
+  sessionKey: string;
+  storePath: string;
+  triggerText: string;
+  wasMentioned: boolean;
+}): Promise<boolean> {
+  if (!params.replyTarget.isGroup || !params.replyTarget.groupId) {
+    return false;
+  }
+
+  const summaryConfig = getGroupSummaryConfig(api);
+  const command = parseGroupSummaryCommand(params.triggerText, summaryConfig.method);
+  if (!command) {
+    return false;
+  }
+
+  let selection: ReturnType<typeof selectGroupSummarySource> | null = null;
+  if (!command.showHelp && summaryConfig.enabled && canUseGroupSummaryAi(summaryConfig.ai)) {
+    selection = selectGroupSummarySource({
+      command,
+      config: summaryConfig,
+      sessionKey: params.sessionKey,
+      storePath: params.storePath
+    });
+  }
+
+  const ctxPayload = buildInboundContext(api, runtime, {
+    commandText: params.triggerText,
+    messageText: params.messageText,
+    replyTarget: params.replyTarget,
+    sessionKey: params.sessionKey,
+    wasMentioned: params.wasMentioned
+  });
+  await recordInboundSession(api, runtime, {
+    ctx: ctxPayload,
+    replyTarget: params.replyTarget.replyTarget,
+    sessionKey: params.sessionKey,
+    storePath: params.storePath
+  });
+
+  let replyText = "";
+  if (command.showHelp) {
+    replyText = buildGroupSummaryHelpText();
+  } else if (!summaryConfig.enabled) {
+    replyText = buildGroupSummaryDisabledText();
+  } else if (!canUseGroupSummaryAi(summaryConfig.ai)) {
+    replyText = buildGroupSummaryConfigMissingText();
+  } else if (!selection || !selection.transcriptText) {
+    replyText = selection?.emptyReason ?? "当前没有可用于总结的群聊内容。";
+  } else {
+    try {
+      replyText = await generateGroupSummaryWithAi({
+        apiConfig: summaryConfig.ai,
+        commandText: params.triggerText,
+        focusKeywords: selection.focusKeywords,
+        groupName: params.replyTarget.groupName,
+        logger: api.logger,
+        method: command.method,
+        requesterLabel: params.replyTarget.senderLabel,
+        scopeLabel: selection.scopeLabel,
+        transcriptText: selection.transcriptText
+      });
+    } catch (error) {
+      api.logger?.error?.(`[onebot] group summary failed: ${error instanceof Error ? error.message : String(error)}`);
+      replyText = `群总结失败：${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
+
+  const finalReply = clipText(replyText || "群总结失败：没有拿到可用结果。", GROUP_SUMMARY_OUTPUT_CHAR_LIMIT);
+  await sendGroupMsg(params.replyTarget.groupId, finalReply, () => getOneBotConfig(api)).catch(() => undefined);
+  await appendOriginalSessionAssistantMirrorWithRetry({
+    logger: api.logger,
+    model: "onebot-group-summary",
+    originalSessionKey: params.sessionKey,
+    storePath: params.storePath,
+    text: finalReply,
+    timestampMs: Date.now()
+  });
+  return true;
+}
+
 export async function processInboundMessage(api: any, msg: OneBotMessage): Promise<void> {
   const runtime = api.runtime;
   if (!runtime?.channel?.reply?.dispatchReplyWithBufferedBlockDispatcher) {
@@ -1192,15 +1690,25 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
   }
 
   const imageSegments = getImageSegments(msg);
-  const inboundImages = await resolveInboundImageAttachments(api, msg, () => config);
+  const videoSegments = getVideoSegments(msg);
+  const currentInboundMedia = await resolveInboundMediaAttachments(api, msg, () => config);
+  const wasMentioned = isMentioned(msg, selfId);
 
   const replyId = getReplyMessageId(msg);
+  let quotedInboundMedia: InboundMediaAttachment[] = [];
   let messageText: string;
   if (replyId != null) {
-    const currentText = getTextFromSegments(msg);
+    const currentText = getReadableRawText(msg, { selfId });
     try {
       const quoted = await getMsg(replyId);
-      const quotedText = getTextFromMessageContent(quoted?.message);
+      if (quoted?.message) {
+        quotedInboundMedia = await resolveInboundMediaAttachments(api, {
+          post_type: "message",
+          message: quoted.message,
+          raw_message: typeof quoted.message === "string" ? quoted.message : undefined
+        }, () => config);
+      }
+      const quotedText = getReadableTextFromMessageContent(quoted?.message, { selfId });
       const senderLabel = quoted?.sender?.nickname ?? quoted?.sender?.user_id ?? "某人";
       messageText = quotedText
         ? `[引用 ${String(senderLabel)} 的消息：${quotedText}]\n${currentText}`
@@ -1209,11 +1717,16 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
       messageText = currentText;
     }
   } else {
-    messageText = getRawText(msg);
+    messageText = getReadableRawText(msg, { selfId });
   }
 
-  if (!messageText.trim() && imageSegments.length > 0) {
-    messageText = buildImagePlaceholder(imageSegments.length);
+  const inboundMedia = dedupeInboundMediaAttachments([currentInboundMedia, quotedInboundMedia]);
+
+  if (!messageText.trim() && (imageSegments.length > 0 || videoSegments.length > 0)) {
+    messageText = buildMediaPlaceholder({
+      imageCount: imageSegments.length,
+      videoCount: videoSegments.length
+    });
   }
 
   if (!messageText.trim() || !msg.user_id) {
@@ -1221,13 +1734,13 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
   }
 
   const isGroup = msg.message_type === "group";
-  if (isGroup && getRequireMention(api) && !isMentioned(msg, selfId)) {
+  if (isGroup && getRequireMention(api) && !wasMentioned) {
     return;
   }
 
   const groupIncreaseConfig = getGroupIncreaseConfig(api);
   const triggerText = getTextFromSegments(msg).trim() || messageText.trim();
-  if (isGroup && groupIncreaseConfig.enabled && isMentioned(msg, selfId) && /^\/group-increase\s*$/i.test(triggerText)) {
+  if (isGroup && groupIncreaseConfig.enabled && wasMentioned && /^\/group-increase\s*$/i.test(triggerText)) {
     await handleGroupIncrease(api, {
       post_type: "notice",
       notice_type: "group_increase",
@@ -1239,13 +1752,20 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
 
   const userId = Number(msg.user_id);
   const groupId = msg.group_id ? Number(msg.group_id) : undefined;
+  const [senderIdentity, groupName] = await Promise.all([
+    resolveSenderIdentity(msg),
+    isGroup ? resolveGroupName(groupId) : Promise.resolve(undefined),
+  ]);
   const replyTargetValue = isGroup ? `onebot:group:${groupId}` : `onebot:user:${userId}`;
   const replyTarget: ReplyTarget = {
     chatType: isGroup ? "group" : "direct",
     groupId,
+    groupName,
     isGroup,
     replyTarget: replyTargetValue,
-    senderLabel: String(userId),
+    senderCard: senderIdentity.senderCard,
+    senderLabel: senderIdentity.senderLabel,
+    senderName: senderIdentity.senderName,
     userId
   };
   const legacySessionKey = buildOneBotSessionKey(replyTarget);
@@ -1280,6 +1800,17 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
     });
   }
 
+  if (await handleGroupSummaryCommand(api, runtime, {
+    messageText,
+    replyTarget,
+    sessionKey,
+    storePath,
+    triggerText,
+    wasMentioned
+  })) {
+    return;
+  }
+
   const asyncConfig = getAsyncReplyConfig(api);
   const asyncTrigger = await resolveAsyncTrigger({
     asyncConfig,
@@ -1301,10 +1832,12 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
     }
 
     const originalCtxPayload = buildInboundContext(api, runtime, {
-      mediaAttachments: inboundImages,
+      commandText: triggerText,
+      mediaAttachments: inboundMedia,
       messageText,
       replyTarget,
-      sessionKey
+      sessionKey,
+      wasMentioned
     });
 
     await recordInboundSession(api, runtime, {
@@ -1333,10 +1866,11 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
     api.logger?.info?.(`[onebot] async task accepted (${triggerMeta}) ${sessionKey}`);
     if (!asyncConfig.spawnTaskSession) {
       const inlineCtxPayload = buildInboundContext(api, runtime, {
-        mediaAttachments: inboundImages,
+        mediaAttachments: inboundMedia,
         messageText: asyncTrigger.taskMessageText,
         replyTarget,
-        sessionKey
+        sessionKey,
+        wasMentioned
       });
       api.logger?.info?.(`[onebot] async child session disabled; continue on original session without ack ${sessionKey}`);
       void (async () => {
@@ -1410,7 +1944,7 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
     void handleDetachedAsyncReply(api, runtime, {
       agentId: route.agentId ?? "main",
       asyncConfig,
-      mediaAttachments: inboundImages,
+      mediaAttachments: inboundMedia,
       messageText: asyncTrigger.taskMessageText,
       originalRequestText: messageText.trim(),
       originalSessionKey: sessionKey,
@@ -1431,11 +1965,13 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
   });
 
   const ctxPayload = buildInboundContext(api, runtime, {
-    mediaAttachments: inboundImages,
+    commandText: triggerText,
+    mediaAttachments: inboundMedia,
     messageText,
     replyTarget,
     sessionKey,
-    untrustedContext: asyncTaskContext ? [asyncTaskContext] : undefined
+    untrustedContext: asyncTaskContext ? [asyncTaskContext] : undefined,
+    wasMentioned
   });
 
   await recordInboundSession(api, runtime, {

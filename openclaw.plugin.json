@@ -4,14 +4,19 @@
   "version": "0.1.0",
   "description": "Minimal OneBot v11 protocol channel plugin",
   "author": "OpenAI Codex",
-  "channels": ["onebot"],
+  "channels": [
+    "onebot"
+  ],
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
     "properties": {
       "type": {
         "type": "string",
-        "enum": ["forward-websocket", "backward-websocket"],
+        "enum": [
+          "forward-websocket",
+          "backward-websocket"
+        ],
         "description": "连接类型：正向或反向 WebSocket"
       },
       "host": {
@@ -52,6 +57,76 @@
             "description": "欢迎语模板，支持 {name} / {groupName} / {userId} / {groupId} / {avatarUrl}"
           }
         }
+      },
+      "groupSummary": {
+        "type": "object",
+        "description": "群聊总结相关配置（当前主要用于预留 AI 总结能力参数）",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "是否启用群总结配置"
+          },
+          "method": {
+            "type": "string",
+            "enum": [
+              "recent-messages",
+              "since-last-reply",
+              "focused-keywords"
+            ],
+            "default": "recent-messages",
+            "description": "默认总结方式"
+          },
+          "recentMessages": {
+            "type": "number",
+            "default": 80,
+            "description": "参与总结的最近消息条数"
+          },
+          "contextCharLimit": {
+            "type": "number",
+            "default": 6000,
+            "description": "参与总结的上下文最大字符数"
+          },
+          "focusKeywords": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "focused-keywords 模式下的关注关键词"
+          },
+          "ai": {
+            "type": "object",
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "default": true
+              },
+              "baseUrl": {
+                "type": "string",
+                "default": "https://api.moonshot.cn/v1"
+              },
+              "apiKey": {
+                "type": "string",
+                "description": "Moonshot API Key"
+              },
+              "model": {
+                "type": "string",
+                "default": "kimi-k2.5",
+                "description": "默认群总结模型，推荐非 thinking 版本"
+              },
+              "timeoutMs": {
+                "type": "number",
+                "default": 30000
+              },
+              "maxTokens": {
+                "type": "number",
+                "default": 1024
+              },
+              "temperature": {
+                "type": "number",
+                "default": 0.3
+              }
+            }
+          }
+        }
       }
     }
   },
@@ -68,6 +143,10 @@
       "label": "端口",
       "placeholder": "3001"
     }
-  }
+  },
+  "skills": [
+    "skills/onebot-ops",
+    "skills/onebot-emoji-style",
+    "skills/onebot-emoji-actions"
+  ]
 }
-

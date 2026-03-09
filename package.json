@@ -19,7 +19,9 @@
       "./src/index.ts"
     ],
     "skills": [
-      "skills/onebot-ops"
+      "skills/onebot-ops",
+      "skills/onebot-emoji-style",
+      "skills/onebot-emoji-actions"
     ],
     "channel": {
       "id": "onebot",

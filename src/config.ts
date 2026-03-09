@@ -76,6 +76,27 @@ export interface OneBotAsyncReplyConfig {
   spawnTaskSession: boolean;
 }
 
+export type OneBotGroupSummaryMethod = "focused-keywords" | "recent-messages" | "since-last-reply";
+
+export interface OneBotGroupSummaryAiConfig {
+  apiKey?: string;
+  baseUrl: string;
+  enabled: boolean;
+  maxTokens: number;
+  model: string;
+  temperature: number;
+  timeoutMs: number;
+}
+
+export interface OneBotGroupSummaryConfig {
+  ai: OneBotGroupSummaryAiConfig;
+  contextCharLimit: number;
+  enabled: boolean;
+  focusKeywords: string[];
+  method: OneBotGroupSummaryMethod;
+  recentMessages: number;
+}
+
 function getRootConfig(apiOrCfg?: any): any {
   return apiOrCfg?.config ?? apiOrCfg ?? (globalThis as any).__onebotGatewayConfig ?? {};
 }
@@ -242,6 +263,42 @@ export function getAsyncReplyConfig(apiOrCfg?: any): OneBotAsyncReplyConfig {
       maxTokens: resolvePositiveInteger(ai.maxTokens, 48),
       temperature: resolveNumber(ai.temperature, 0.6, 0, 2),
       fallbackToKeywords: ai.fallbackToKeywords === undefined ? true : Boolean(ai.fallbackToKeywords)
+    }
+  };
+}
+
+export function getGroupSummaryConfig(apiOrCfg?: any): OneBotGroupSummaryConfig {
+  const channel = getOneBotChannelConfig(apiOrCfg);
+  const groupSummary = channel.groupSummary ?? {};
+  const ai = groupSummary.ai ?? {};
+  const apiKey = resolveOptionalString(
+    ai.apiKey,
+    process.env.ONEBOT_GROUP_SUMMARY_AI_API_KEY,
+    process.env.MOONSHOT_API_KEY
+  );
+
+  const method = resolveOptionalString(groupSummary.method, process.env.ONEBOT_GROUP_SUMMARY_METHOD);
+  const normalizedMethod = method === "since-last-reply" || method === "focused-keywords"
+    ? method
+    : "recent-messages";
+
+  return {
+    enabled: groupSummary.enabled === undefined ? false : Boolean(groupSummary.enabled),
+    method: normalizedMethod,
+    recentMessages: resolvePositiveInteger(groupSummary.recentMessages, 80),
+    contextCharLimit: resolvePositiveInteger(groupSummary.contextCharLimit, 6000),
+    focusKeywords: normalizeStringArray(groupSummary.focusKeywords),
+    ai: {
+      enabled: ai.enabled === undefined ? true : Boolean(ai.enabled),
+      apiKey,
+      baseUrl: resolveOptionalString(ai.baseUrl, process.env.ONEBOT_GROUP_SUMMARY_AI_BASE_URL) ?? "https://api.moonshot.cn/v1",
+      model: resolveOptionalString(
+        ai.model,
+        process.env.ONEBOT_GROUP_SUMMARY_AI_MODEL
+      ) ?? "kimi-k2.5",
+      timeoutMs: resolvePositiveInteger(ai.timeoutMs, 30000),
+      maxTokens: resolvePositiveInteger(ai.maxTokens, 1024),
+      temperature: resolveNumber(ai.temperature, 0.3, 0, 2),
     }
   };
 }

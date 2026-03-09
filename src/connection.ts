@@ -72,8 +72,8 @@ function nextImageTempFile(ext: string): string {
   );
 }
 
-function inferImageExtension(value: string): string {
-  return value.match(/\.(png|jpg|jpeg|gif|webp|bmp|tiff|tif)(?:\?|$)/i)?.[1]?.toLowerCase() ?? "png";
+function inferMediaExtension(value: string, fallback = "bin"): string {
+  return value.match(/\.(png|jpg|jpeg|gif|webp|bmp|tiff|tif|mp4|webm|mov|m4v|avi|mkv)(?:\?|$)/i)?.[1]?.toLowerCase() ?? fallback;
 }
 
 function normalizeLocalPath(value: string): string {
@@ -104,7 +104,7 @@ function downloadUrl(url: string): Promise<Buffer> {
       family: 4,
       headers: {
         "User-Agent": "openclaw-onebot/0.1",
-        "Accept": "image/*,*/*;q=0.8"
+        "Accept": "image/*,video/*,*/*;q=0.8"
       }
     }, (res) => {
       const redirect = res.statusCode && res.statusCode >= 300 && res.statusCode < 400 ? res.headers.location : undefined;
@@ -144,7 +144,7 @@ async function resolveImageToLocalPath(image: string): Promise<string> {
     return normalizeLocalPath(fullPath);
   }
   if (/^https?:\/\//i.test(value)) {
-    const ext = inferImageExtension(value);
+    const ext = inferMediaExtension(value, "png");
     const fullPath = nextImageTempFile(ext);
     writeFileSync(fullPath, await downloadUrl(value));
     return normalizeLocalPath(fullPath);
@@ -152,30 +152,34 @@ async function resolveImageToLocalPath(image: string): Promise<string> {
   return normalizeLocalPath(value);
 }
 
-export async function stageInboundImageToLocalPath(image: string): Promise<string> {
-  const value = image.trim();
+export async function stageInboundMediaToLocalPath(media: string, fallbackExt = "bin"): Promise<string> {
+  const value = media.trim();
   if (!value) {
-    throw new Error("Empty image");
+    throw new Error("Empty media");
   }
   if (value.startsWith("base64://")) {
-    const fullPath = nextImageTempFile("png");
+    const fullPath = nextImageTempFile(fallbackExt);
     writeFileSync(fullPath, Buffer.from(value.slice(9), "base64"));
     return normalizeLocalPath(fullPath);
   }
   if (/^https?:\/\//i.test(value)) {
-    const ext = inferImageExtension(value);
+    const ext = inferMediaExtension(value, fallbackExt);
     const fullPath = nextImageTempFile(ext);
     writeFileSync(fullPath, await downloadUrl(value));
     return normalizeLocalPath(fullPath);
   }
   const localPath = value.startsWith("file://") ? value.slice(7) : value;
   if (!looksLikeAbsoluteLocalPath(localPath)) {
-    throw new Error(`Unsupported inbound image reference: ${value}`);
+    throw new Error(`Unsupported inbound media reference: ${value}`);
   }
-  const ext = inferImageExtension(localPath);
+  const ext = inferMediaExtension(localPath, fallbackExt);
   const fullPath = nextImageTempFile(ext);
   copyFileSync(localPath, fullPath);
   return normalizeLocalPath(fullPath);
+}
+
+export async function stageInboundImageToLocalPath(image: string): Promise<string> {
+  return stageInboundMediaToLocalPath(image, "png");
 }
 
 function setupEchoHandler(socket: WebSocket): void {
@@ -380,10 +384,12 @@ async function normalizeOutboundMessage(message: OneBotOutboundMessage): Promise
   return normalized;
 }
 
-async function sendMessage(action: "send_private_msg" | "send_group_msg", params: { user_id?: number; group_id?: number }, message: OneBotOutboundMessage, getConfig?: () => OneBotAccountConfig | null): Promise<number | undefined> {
+async function sendMessage(action: "send_private_msg" | "send_group_msg", params: { user_id?: number | string; group_id?: number | string }, message: OneBotOutboundMessage, getConfig?: () => OneBotAccountConfig | null): Promise<number | undefined> {
   const socket = getConfig ? await ensureConnection(getConfig) : await waitForConnection();
   const res = await sendOneBotAction(socket, action, {
     ...params,
+    user_id: params.user_id != null ? String(params.user_id) : undefined,
+    group_id: params.group_id != null ? String(params.group_id) : undefined,
     message: await normalizeOutboundMessage(message)
   });
   assertOk(res, action);
@@ -391,23 +397,23 @@ async function sendMessage(action: "send_private_msg" | "send_group_msg", params
 }
 
 export async function sendPrivateMsg(userId: number, message: OneBotOutboundMessage, getConfig?: () => OneBotAccountConfig | null): Promise<number | undefined> {
-  return sendMessage("send_private_msg", { user_id: userId }, message, getConfig);
+  return sendMessage("send_private_msg", { user_id: String(userId) }, message, getConfig);
 }
 
 export async function sendGroupMsg(groupId: number, message: OneBotOutboundMessage, getConfig?: () => OneBotAccountConfig | null): Promise<number | undefined> {
-  return sendMessage("send_group_msg", { group_id: groupId }, message, getConfig);
+  return sendMessage("send_group_msg", { group_id: String(groupId) }, message, getConfig);
 }
 
-async function sendImageMessage(action: "send_private_msg" | "send_group_msg", params: { user_id?: number; group_id?: number }, image: string, getConfig?: () => OneBotAccountConfig | null): Promise<number | undefined> {
+async function sendImageMessage(action: "send_private_msg" | "send_group_msg", params: { user_id?: number | string; group_id?: number | string }, image: string, getConfig?: () => OneBotAccountConfig | null): Promise<number | undefined> {
   return sendMessage(action, params, [{ type: "image", data: { file: image } }], getConfig);
 }
 
 export async function sendPrivateImage(userId: number, image: string, getConfig?: () => OneBotAccountConfig | null): Promise<number | undefined> {
-  return sendImageMessage("send_private_msg", { user_id: userId }, image, getConfig);
+  return sendImageMessage("send_private_msg", { user_id: String(userId) }, image, getConfig);
 }
 
 export async function sendGroupImage(groupId: number, image: string, getConfig?: () => OneBotAccountConfig | null): Promise<number | undefined> {
-  return sendImageMessage("send_group_msg", { group_id: groupId }, image, getConfig);
+  return sendImageMessage("send_group_msg", { group_id: String(groupId) }, image, getConfig);
 }
 
 export async function getMsg(messageId: number): Promise<{ sender?: { nickname?: string; user_id?: number }; message?: string | OneBotMessageSegment[] } | null> {

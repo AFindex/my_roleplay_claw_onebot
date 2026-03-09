@@ -60,4 +60,4 @@ npm run test:connect
 
 - 插件入口是 `src/index.ts`
 - `scripts/test-connect.ts` 会优先读取默认 OpenClaw 配置里的 OneBot 参数
-- 如果只是改 `skills/onebot-ops/**`，通常下一次 agent turn 就会生效
+- 如果只是改 `skills/**`，通常下一次 agent turn 就会生效

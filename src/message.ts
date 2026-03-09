@@ -1,5 +1,9 @@
 import type { OneBotMessage, OneBotMessageSegment } from "./types.js";
 
+type ReadableTextOptions = {
+  selfId?: number;
+};
+
 function stripCqCodes(text: string): string {
   return text.replace(/\[CQ:[^\]]+\]/g, "").trim();
 }
@@ -33,6 +37,60 @@ function parseCqSegmentData(raw: string): Record<string, string> {
   return data;
 }
 
+function formatAtText(qq: string | number | boolean | undefined, options: ReadableTextOptions = {}): string {
+  const target = String(qq ?? "").trim();
+  if (!target) {
+    return "@某人";
+  }
+  if (target === "all") {
+    return "@全体成员";
+  }
+  if (options.selfId != null && target === String(options.selfId)) {
+    return "@你";
+  }
+  return `@${target}`;
+}
+
+function segmentToReadableText(segment: OneBotMessageSegment, options: ReadableTextOptions = {}): string {
+  if (segment.type === "text") {
+    return String(segment.data?.text ?? "");
+  }
+  if (segment.type === "at") {
+    return formatAtText(segment.data?.qq, options);
+  }
+  if (segment.type === "image") {
+    return "[图片]";
+  }
+  if (segment.type === "video") {
+    return "[视频]";
+  }
+  return "";
+}
+
+function renderSegmentsToReadableText(segments: OneBotMessageSegment[], options: ReadableTextOptions = {}): string {
+  return segments.map((segment) => segmentToReadableText(segment, options)).join("").trim();
+}
+
+function replaceCqSegment(type: string, rawData: string | undefined, options: ReadableTextOptions = {}): string {
+  if (type === "at") {
+    const data = parseCqSegmentData(rawData ?? "");
+    return formatAtText(data.qq, options);
+  }
+  if (type === "image") {
+    return "[图片]";
+  }
+  if (type === "video") {
+    return "[视频]";
+  }
+  return "";
+}
+
+function renderCqToReadableText(text: string, options: ReadableTextOptions = {}): string {
+  return text.replace(/\[(?:CQ|cq):([^,\]]+)(?:,([^\]]+))?\]/g, (_match, type: string, rawData?: string) => {
+    return replaceCqSegment(type.toLowerCase(), rawData, options);
+  }).trim();
+}
+
 export function getTextFromMessageContent(content: string | OneBotMessageSegment[] | undefined): string {
   if (!content) return "";
   if (Array.isArray(content)) {
@@ -45,6 +103,17 @@ export function getTextFromMessageContent(content: string | OneBotMessageSegment
   return stripCqCodes(String(content));
 }
 
+export function getReadableTextFromMessageContent(
+  content: string | OneBotMessageSegment[] | undefined,
+  options: ReadableTextOptions = {}
+): string {
+  if (!content) return "";
+  if (Array.isArray(content)) {
+    return renderSegmentsToReadableText(content, options);
+  }
+  return renderCqToReadableText(String(content), options);
+}
+
 export function getTextFromSegments(msg: OneBotMessage): string {
   return getTextFromMessageContent(msg.message);
 }
@@ -54,6 +123,17 @@ export function getRawText(msg: OneBotMessage): string {
     return stripCqCodes(msg.raw_message);
   }
   return getTextFromMessageContent(msg.message);
+}
+
+export function getReadableRawText(msg: OneBotMessage, options: ReadableTextOptions = {}): string {
+  const segments = getSegments(msg.message);
+  if (segments.length > 0) {
+    return renderSegmentsToReadableText(segments, options);
+  }
+  if (typeof msg.raw_message === "string") {
+    return renderCqToReadableText(msg.raw_message, options);
+  }
+  return getReadableTextFromMessageContent(msg.message, options);
 }
 
 export function getImageSegments(msg: OneBotMessage): OneBotMessageSegment[] {
@@ -75,6 +155,31 @@ export function getImageSegments(msg: OneBotMessage): OneBotMessageSegment[] {
     }
     result.push({
       type: "image",
+      data: parseCqSegmentData(params),
+    });
+  }
+  return result;
+}
+
+export function getVideoSegments(msg: OneBotMessage): OneBotMessageSegment[] {
+  const segments = getSegments(msg.message);
+  if (segments.length > 0) {
+    return segments.filter((segment) => segment.type === "video");
+  }
+
+  const raw = String(msg.raw_message ?? msg.message ?? "");
+  if (!raw.includes("[CQ:video,")) {
+    return [];
+  }
+
+  const result: OneBotMessageSegment[] = [];
+  for (const match of raw.matchAll(/\[CQ:video,([^\]]+)\]/g)) {
+    const params = match[1]?.trim();
+    if (!params) {
+      continue;
+    }
+    result.push({
+      type: "video",
       data: parseCqSegmentData(params),
     });
   }

@@ -44,7 +44,10 @@ export const OneBotChannelPlugin = {
   messaging: {
     normalizeTarget: normalizeOneBotMessagingTarget,
     targetResolver: {
-      looksLikeId: (raw: string) => /^group:\d+$/.test(raw.trim()) || /^user:\d+$/.test(raw.trim()) || /^\d{6,}$/.test(raw.trim()),
+      looksLikeId: (raw: string) => {
+        const normalized = normalizeOneBotMessagingTarget(raw) ?? raw.trim();
+        return /^group:\d+$/.test(normalized) || /^user:\d+$/.test(normalized) || /^\d{6,}$/.test(normalized);
+      },
       hint: "user:<QQ号> 或 group:<群号>"
     }
   },
@@ -68,7 +71,7 @@ export const OneBotChannelPlugin = {
     chunkerMode: "text" as const,
     textChunkLimit: 2000,
     resolveTarget: ({ to }: { to?: string }) => {
-      const value = to?.trim();
+      const value = normalizeOneBotMessagingTarget(to ?? "") ?? to?.trim();
       if (!value) {
         return { ok: false, error: new Error("OneBot requires --target <user_id|group_id>") };
       }

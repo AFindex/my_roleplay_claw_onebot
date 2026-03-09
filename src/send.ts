@@ -1,6 +1,7 @@
 import { getRenderMarkdownToPlain } from "./config.js";
 import { sendGroupMsg, sendPrivateMsg } from "./connection.js";
 import { collapseDoubleNewlines, markdownToPlain } from "./markdown.js";
+import { buildOneBotCqMessageFromSegments, buildOneBotSegmentsFromRichText } from "./onebot-rich-text.js";
 import { resolveTargetForReply } from "./reply-context.js";
 import type { OneBotAccountConfig } from "./types.js";
 
@@ -34,6 +35,21 @@ function normalizeText(text: string, cfg?: any): string {
   return collapseDoubleNewlines(next);
 }
 
+function buildOutboundTextPayload(text: string, targetType: "user" | "group") {
+  const segments = buildOneBotSegmentsFromRichText(text, {
+    isGroup: targetType === "group"
+  });
+  const cqMessage = targetType === "group"
+    ? buildOneBotCqMessageFromSegments(segments)
+    : null;
+  if (cqMessage) {
+    return cqMessage;
+  }
+  return segments.length === 1 && segments[0]?.type === "text"
+    ? String(segments[0].data?.text ?? "")
+    : segments;
+}
+
 export async function sendTextMessage(to: string, text: string, getConfig?: OneBotConfigGetter, cfg?: any): Promise<OneBotSendResult> {
   const resolved = resolveTargetForReply(to);
   const target = parseTarget(resolved);
@@ -45,9 +61,10 @@ export async function sendTextMessage(to: string, text: string, getConfig?: OneB
     return { ok: false, error: "No text provided" };
   }
   try {
+    const outbound = buildOutboundTextPayload(normalizedText, target.type);
     const messageId = target.type === "group"
-      ? await sendGroupMsg(target.id, normalizedText, getConfig)
-      : await sendPrivateMsg(target.id, normalizedText, getConfig);
+      ? await sendGroupMsg(target.id, outbound, getConfig)
+      : await sendPrivateMsg(target.id, outbound, getConfig);
     return { ok: true, messageId: messageId != null ? String(messageId) : "" };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
@@ -66,7 +83,7 @@ export async function sendMediaMessage(to: string, mediaUrl: string, text?: stri
   try {
     const normalizedText = text?.trim() ? normalizeText(text, cfg) : "";
     const message = [
-      ...(normalizedText ? [{ type: "text", data: { text: normalizedText } }] : []),
+      ...buildOneBotSegmentsFromRichText(normalizedText, { isGroup: target.type === "group" }),
       { type: "image", data: { file: mediaUrl.trim() } }
     ];
     const messageId = target.type === "group"
@@ -77,4 +94,3 @@ export async function sendMediaMessage(to: string, mediaUrl: string, text?: stri
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
 }
-
