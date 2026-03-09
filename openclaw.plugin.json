@@ -11,6 +11,15 @@
     "type": "object",
     "additionalProperties": false,
     "properties": {
+      "provider": {
+        "type": "string",
+        "enum": [
+          "generic",
+          "napcat"
+        ],
+        "default": "generic",
+        "description": "OneBot 后端提供方。默认按标准 OneBot 兼容实现处理；只有 napcat 才启用 NapCat 私有扩展。"
+      },
       "type": {
         "type": "string",
         "enum": [
@@ -55,6 +64,27 @@
           "message": {
             "type": "string",
             "description": "欢迎语模板，支持 {name} / {groupName} / {userId} / {groupId} / {avatarUrl}"
+          }
+        }
+      },
+      "requests": {
+        "type": "object",
+        "description": "好友/加群请求处理策略。默认全部只记录，不自动通过。",
+        "properties": {
+          "autoApproveFriend": {
+            "type": "boolean",
+            "default": false,
+            "description": "是否自动通过好友申请"
+          },
+          "autoApproveGroupAdd": {
+            "type": "boolean",
+            "default": false,
+            "description": "是否自动通过加群申请"
+          },
+          "autoApproveGroupInvite": {
+            "type": "boolean",
+            "default": false,
+            "description": "是否自动通过被邀请入群"
           }
         }
       },
@@ -131,6 +161,10 @@
     }
   },
   "uiHints": {
+    "provider": {
+      "label": "Provider",
+      "placeholder": "generic"
+    },
     "accessToken": {
       "label": "Access Token",
       "sensitive": true

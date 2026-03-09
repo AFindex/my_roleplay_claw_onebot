@@ -1,7 +1,7 @@
 import { getOneBotConfig, getRenderMarkdownToPlain } from "../config.js";
-import { isKnownNapCatGroupSendBlockedError, sendGroupMsg, sendPrivateMsg } from "../connection.js";
+import { isKnownNapCatGroupSendBlockedError, sendForwardMsg, sendGroupMsg, sendPoke, sendPrivateMsg } from "../connection.js";
 import { collapseDoubleNewlines, markdownToPlain } from "../markdown.js";
-import { buildOneBotCqMessageFromSegments, parseOneBotRichText, resolveOneBotMentionTarget } from "../onebot-rich-text.js";
+import { buildOneBotCqMessageFromSegments, parseOneBotRichText, resolveOneBotMentionTarget, resolveOneBotPokeTarget } from "../onebot-rich-text.js";
 import { withReplyTarget } from "../reply-context.js";
 import type { OneBotMessageSegment } from "../types.js";
 import type { ReplyTarget } from "./process-inbound-shared.js";
@@ -9,6 +9,14 @@ import type { ReplyTarget } from "./process-inbound-shared.js";
 export type ReplyPayload = { text?: string; body?: string; mediaUrl?: string; mediaUrls?: string[] } | string;
 
 type CapturedReplyPart =
+  | { type: "dice" }
+  | { type: "face"; id: string }
+  | { type: "file"; fileUrl: string; name?: string }
+  | { type: "forward"; messageIds: string[] }
+  | { type: "record"; mediaUrl: string }
+  | { type: "poke"; target: string }
+  | { type: "reply"; messageId: string }
+  | { type: "rps" }
   | { type: "mention"; target: string }
   | { type: "text"; text: string }
   | { type: "image"; mediaUrl: string };
@@ -56,6 +64,30 @@ function extractOneBotRichParts(text: string): CapturedReplyPart[] {
     if (part.type === "image") {
       return { type: "image", mediaUrl: part.mediaUrl };
     }
+    if (part.type === "record") {
+      return { type: "record", mediaUrl: part.mediaUrl };
+    }
+    if (part.type === "file") {
+      return { type: "file", fileUrl: part.fileUrl, name: part.name };
+    }
+    if (part.type === "forward") {
+      return { type: "forward", messageIds: part.messageIds };
+    }
+    if (part.type === "poke") {
+      return { type: "poke", target: part.target };
+    }
+    if (part.type === "reply") {
+      return { type: "reply", messageId: part.messageId };
+    }
+    if (part.type === "face") {
+      return { type: "face", id: part.id };
+    }
+    if (part.type === "rps") {
+      return { type: "rps" };
+    }
+    if (part.type === "dice") {
+      return { type: "dice" };
+    }
     if (part.type === "mention") {
       return { type: "mention", target: part.target };
     }
@@ -94,6 +126,50 @@ function pushCapturedMediaUrl(capture: CapturedReply, mediaUrl: string): void {
   capture.parts.push({ type: "image", mediaUrl: normalizedMediaUrl });
 }
 
+function pushCapturedRecordUrl(capture: CapturedReply, mediaUrl: string): void {
+  const normalizedMediaUrl = mediaUrl.trim();
+  if (!normalizedMediaUrl) {
+    return;
+  }
+  capture.parts.push({ type: "record", mediaUrl: normalizedMediaUrl });
+}
+
+function pushCapturedFile(capture: CapturedReply, fileUrl: string, name?: string): void {
+  const normalizedFileUrl = fileUrl.trim();
+  if (!normalizedFileUrl) {
+    return;
+  }
+  capture.parts.push({
+    type: "file",
+    fileUrl: normalizedFileUrl,
+    name: typeof name === "string" && name.trim() ? name.trim() : undefined
+  });
+}
+
+function pushCapturedForward(capture: CapturedReply, messageIds: string[]): void {
+  const normalizedIds = Array.from(new Set(messageIds.map((item) => item.trim()).filter((item) => /^\d+$/.test(item))));
+  if (normalizedIds.length === 0) {
+    return;
+  }
+  capture.parts.push({ type: "forward", messageIds: normalizedIds });
+}
+
+function pushCapturedReplyReference(capture: CapturedReply, messageId: string): void {
+  const normalizedId = messageId.trim();
+  if (!normalizedId) {
+    return;
+  }
+  capture.parts.push({ type: "reply", messageId: normalizedId });
+}
+
+function pushCapturedPoke(capture: CapturedReply, target: string): void {
+  const normalizedTarget = target.trim();
+  if (!normalizedTarget) {
+    return;
+  }
+  capture.parts.push({ type: "poke", target: normalizedTarget });
+}
+
 function pushCapturedMention(capture: CapturedReply, target: string): void {
   const normalizedTarget = target.trim();
   if (!normalizedTarget) {
@@ -102,12 +178,55 @@ function pushCapturedMention(capture: CapturedReply, target: string): void {
   capture.parts.push({ type: "mention", target: normalizedTarget });
 }
 
+function pushCapturedFace(capture: CapturedReply, id: string): void {
+  const normalizedId = id.trim();
+  if (!normalizedId) {
+    return;
+  }
+  capture.parts.push({ type: "face", id: normalizedId });
+}
+
+function pushCapturedAction(capture: CapturedReply, type: "rps" | "dice"): void {
+  capture.parts.push({ type });
+}
+
 function buildCapturedReplySegments(captured: CapturedReply, target: ReplyTarget): OneBotMessageSegment[] {
   const segments: OneBotMessageSegment[] = [];
 
   for (const part of captured.parts) {
     if (part.type === "image") {
       segments.push({ type: "image", data: { file: part.mediaUrl } });
+      continue;
+    }
+
+    if (part.type === "record") {
+      segments.push({ type: "record", data: { file: part.mediaUrl } });
+      continue;
+    }
+
+    if (part.type === "file") {
+      segments.push({
+        type: "file",
+        data: {
+          file: part.fileUrl,
+          name: part.name
+        }
+      });
+      continue;
+    }
+
+    if (part.type === "reply") {
+      segments.push({ type: "reply", data: { id: part.messageId } });
+      continue;
+    }
+
+    if (part.type === "forward") {
+      segments.push({ type: "text", data: { text: "[合并转发]" } });
+      continue;
+    }
+
+    if (part.type === "poke") {
+      segments.push({ type: "text", data: { text: "[戳一戳]" } });
       continue;
     }
 
@@ -120,6 +239,21 @@ function buildCapturedReplySegments(captured: CapturedReply, target: ReplyTarget
       } else {
         segments.push({ type: "text", data: { text: `@${part.target}` } });
       }
+      continue;
+    }
+
+    if (part.type === "face") {
+      segments.push({ type: "face", data: { id: part.id } });
+      continue;
+    }
+
+    if (part.type === "rps") {
+      segments.push({ type: "rps" });
+      continue;
+    }
+
+    if (part.type === "dice") {
+      segments.push({ type: "dice" });
       continue;
     }
 
@@ -145,6 +279,41 @@ function appendCapturedReplyState(target: CapturedReply, source: CapturedReply):
 
     if (part.type === "mention") {
       target.parts.push({ type: "mention", target: part.target });
+      continue;
+    }
+
+    if (part.type === "record") {
+      target.parts.push({ type: "record", mediaUrl: part.mediaUrl });
+      continue;
+    }
+
+    if (part.type === "file") {
+      target.parts.push({ type: "file", fileUrl: part.fileUrl, name: part.name });
+      continue;
+    }
+
+    if (part.type === "forward") {
+      target.parts.push({ type: "forward", messageIds: [...part.messageIds] });
+      continue;
+    }
+
+    if (part.type === "reply") {
+      target.parts.push({ type: "reply", messageId: part.messageId });
+      continue;
+    }
+
+    if (part.type === "poke") {
+      target.parts.push({ type: "poke", target: part.target });
+      continue;
+    }
+
+    if (part.type === "face") {
+      target.parts.push({ type: "face", id: part.id });
+      continue;
+    }
+
+    if (part.type === "rps" || part.type === "dice") {
+      target.parts.push({ type: part.type });
       continue;
     }
 
@@ -174,9 +343,11 @@ function previewCapturedReplyForLog(captured: CapturedReply): string {
   const text = buildCapturedReplyText(captured);
   const mentionCount = captured.parts.filter((part) => part.type === "mention").length;
   const mediaCount = captured.mediaUrls.length;
+  const actionCount = captured.parts.filter((part) => part.type === "face" || part.type === "rps" || part.type === "dice" || part.type === "record" || part.type === "file" || part.type === "forward" || part.type === "reply" || part.type === "poke").length;
   const parts = [
     text ? `text=${JSON.stringify(previewTextForLog(text, 160))}` : "",
     mentionCount > 0 ? `mentions=${mentionCount}` : "",
+    actionCount > 0 ? `actions=${actionCount}` : "",
     mediaCount > 0 ? `media=${mediaCount}` : ""
   ].filter(Boolean);
 
@@ -217,6 +388,30 @@ export function buildCapturedReplyText(captured: CapturedReply): string {
     if (part.type === "mention") {
       return `@${part.target}`;
     }
+    if (part.type === "record") {
+      return "[语音]";
+    }
+    if (part.type === "file") {
+      return part.name?.trim() ? `[文件:${part.name.trim()}]` : "[文件]";
+    }
+    if (part.type === "forward") {
+      return "[合并转发]";
+    }
+    if (part.type === "reply") {
+      return `[回复:${part.messageId}]`;
+    }
+    if (part.type === "poke") {
+      return "[戳一戳]";
+    }
+    if (part.type === "face") {
+      return `[表情:${part.id}]`;
+    }
+    if (part.type === "rps") {
+      return "[猜拳]";
+    }
+    if (part.type === "dice") {
+      return "[骰子]";
+    }
     return "";
   }).join("")).trim();
 }
@@ -241,6 +436,34 @@ export function appendCapturedReply(api: any, capture: CapturedReply, payload: R
       pushCapturedMediaUrl(capture, part.mediaUrl);
       continue;
     }
+    if (part.type === "record") {
+      pushCapturedRecordUrl(capture, part.mediaUrl);
+      continue;
+    }
+    if (part.type === "file") {
+      pushCapturedFile(capture, part.fileUrl, part.name);
+      continue;
+    }
+    if (part.type === "forward") {
+      pushCapturedForward(capture, part.messageIds);
+      continue;
+    }
+    if (part.type === "reply") {
+      pushCapturedReplyReference(capture, part.messageId);
+      continue;
+    }
+    if (part.type === "poke") {
+      pushCapturedPoke(capture, part.target);
+      continue;
+    }
+    if (part.type === "face") {
+      pushCapturedFace(capture, part.id);
+      continue;
+    }
+    if (part.type === "rps" || part.type === "dice") {
+      pushCapturedAction(capture, part.type);
+      continue;
+    }
     if (part.type === "mention") {
       pushCapturedMention(capture, part.target);
       continue;
@@ -257,8 +480,8 @@ export function appendCapturedReply(api: any, capture: CapturedReply, payload: R
   }
 }
 
-export async function deliverCapturedReply(api: any, target: ReplyTarget, captured: CapturedReply): Promise<void> {
-  const message = buildCapturedReplySegments(captured, target);
+async function sendBufferedReplyParts(api: any, target: ReplyTarget, buffer: CapturedReply): Promise<void> {
+  const message = buildCapturedReplySegments(buffer, target);
   if (message.length === 0) {
     return;
   }
@@ -270,15 +493,106 @@ export async function deliverCapturedReply(api: any, target: ReplyTarget, captur
     ?? (message.length === 1 && message[0]?.type === "text"
       ? String(message[0].data?.text ?? "")
       : message);
-
-  api.logger?.info?.(`[onebot] outbound reply target=${target.replyTarget} captured=${previewCapturedReplyForLog(captured)} ${previewOutboundMessageForLog(outbound)}`);
-
+  api.logger?.info?.(`[onebot] outbound reply target=${target.replyTarget} captured=${previewCapturedReplyForLog(buffer)} ${previewOutboundMessageForLog(outbound)}`);
   if (target.isGroup && target.groupId) {
     await sendGroupMsg(target.groupId, outbound, () => getOneBotConfig(api));
     return;
   }
-
   await sendPrivateMsg(target.userId, outbound, () => getOneBotConfig(api));
+}
+
+async function sendCapturedPoke(api: any, target: ReplyTarget, pokeTarget: string): Promise<void> {
+  const resolvedTarget = resolveOneBotPokeTarget(pokeTarget, target.userId);
+  if (!resolvedTarget || !/^\d+$/.test(resolvedTarget)) {
+    await sendBufferedReplyParts(api, target, {
+      mediaUrls: [],
+      parts: [{ type: "text", text: "[戳一戳]" }],
+      textParts: ["[戳一戳]"]
+    });
+    return;
+  }
+
+  api.logger?.info?.(`[onebot] outbound poke target=${target.replyTarget} user=${resolvedTarget}`);
+  try {
+    await sendPoke({
+      getConfig: () => getOneBotConfig(api),
+      groupId: target.groupId,
+      userId: Number(resolvedTarget)
+    });
+  } catch {
+    await sendBufferedReplyParts(api, target, {
+      mediaUrls: [],
+      parts: [{ type: "text", text: "[戳一戳]" }],
+      textParts: ["[戳一戳]"]
+    });
+  }
+}
+
+function buildForwardNodes(messageIds: string[]): OneBotMessageSegment[] {
+  return messageIds.map((messageId) => ({
+    type: "node",
+    data: { id: messageId }
+  }));
+}
+
+async function sendCapturedForward(api: any, target: ReplyTarget, messageIds: string[]): Promise<void> {
+  if (messageIds.length === 0) {
+    await sendBufferedReplyParts(api, target, {
+      mediaUrls: [],
+      parts: [{ type: "text", text: "[合并转发]" }],
+      textParts: ["[合并转发]"]
+    });
+    return;
+  }
+
+  try {
+    await sendForwardMsg({
+      getConfig: () => getOneBotConfig(api),
+      groupId: target.groupId,
+      userId: target.isGroup ? undefined : target.userId,
+      messages: buildForwardNodes(messageIds)
+    });
+  } catch {
+    await sendBufferedReplyParts(api, target, {
+      mediaUrls: [],
+      parts: [{ type: "text", text: "[合并转发]" }],
+      textParts: ["[合并转发]"]
+    });
+  }
+}
+
+export async function deliverCapturedReply(api: any, target: ReplyTarget, captured: CapturedReply): Promise<void> {
+  const buffer: CapturedReply = { parts: [], textParts: [], mediaUrls: [] };
+
+  const flushBuffer = async (): Promise<void> => {
+    if (buffer.parts.length === 0) {
+      return;
+    }
+    await sendBufferedReplyParts(api, target, buffer);
+    buffer.parts = [];
+    buffer.textParts = [];
+    buffer.mediaUrls = [];
+  };
+
+  for (const part of captured.parts) {
+    if (part.type === "poke") {
+      await flushBuffer();
+      await sendCapturedPoke(api, target, part.target);
+      continue;
+    }
+    if (part.type === "forward") {
+      await flushBuffer();
+      await sendCapturedForward(api, target, part.messageIds);
+      continue;
+    }
+    appendCapturedReplyState(buffer, {
+      mediaUrls: part.type === "image" ? [part.mediaUrl] : [],
+      parts: [part],
+      textParts: part.type === "text" && part.text.trim() ? [part.text.trim()] : []
+    });
+  }
+
+  await flushBuffer();
 }
 
 export async function sendFailureMessage(api: any, target: ReplyTarget, error: unknown, prefix = "处理失败"): Promise<void> {
@@ -355,7 +669,7 @@ export async function dispatchReply(api: any, runtime: any, params: {
         }
       },
       replyOptions: {
-        disableBlockStreaming: true
+        disableBlockStreaming: false
       }
     });
 

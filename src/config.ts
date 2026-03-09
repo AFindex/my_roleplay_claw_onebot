@@ -1,4 +1,4 @@
-import type { OneBotAccountConfig } from "./types.js";
+import type { OneBotAccountConfig, OneBotProvider } from "./types.js";
 
 const DEFAULT_ASYNC_REPLY_KEYWORDS = [
   "查一下",
@@ -97,6 +97,12 @@ export interface OneBotGroupSummaryConfig {
   recentMessages: number;
 }
 
+export interface OneBotRequestHandlingConfig {
+  autoApproveFriend: boolean;
+  autoApproveGroupAdd: boolean;
+  autoApproveGroupInvite: boolean;
+}
+
 function getRootConfig(apiOrCfg?: any): any {
   return apiOrCfg?.config ?? apiOrCfg ?? (globalThis as any).__onebotGatewayConfig ?? {};
 }
@@ -152,6 +158,22 @@ function resolveOptionalString(...values: unknown[]): string | undefined {
   return undefined;
 }
 
+function resolveProvider(...values: unknown[]): OneBotProvider {
+  for (const value of values) {
+    if (typeof value !== "string") {
+      continue;
+    }
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "napcat") {
+      return "napcat";
+    }
+    if (normalized === "generic") {
+      return "generic";
+    }
+  }
+  return "generic";
+}
+
 export function getOneBotChannelConfig(apiOrCfg?: any): Record<string, any> {
   const cfg = getRootConfig(apiOrCfg);
   return cfg?.channels?.onebot ?? {};
@@ -163,6 +185,7 @@ export function getOneBotConfig(apiOrCfg?: any): OneBotAccountConfig | null {
     return {
       accountId: "default",
       enabled: channel.enabled !== false,
+      provider: resolveProvider(channel.provider, process.env.ONEBOT_PROVIDER),
       type: channel.type === "backward-websocket" ? "backward-websocket" : "forward-websocket",
       host: String(channel.host),
       port: Number(channel.port),
@@ -176,6 +199,7 @@ export function getOneBotConfig(apiOrCfg?: any): OneBotAccountConfig | null {
   if (host && Number.isFinite(port)) {
     return {
       accountId: "default",
+      provider: resolveProvider(process.env.ONEBOT_PROVIDER),
       type: process.env.ONEBOT_WS_TYPE === "backward-websocket" ? "backward-websocket" : "forward-websocket",
       host,
       port,
@@ -185,6 +209,15 @@ export function getOneBotConfig(apiOrCfg?: any): OneBotAccountConfig | null {
   }
 
   return null;
+}
+
+export function getOneBotProvider(apiOrCfg?: any): OneBotProvider {
+  const config = getOneBotConfig(apiOrCfg);
+  if (config?.provider) {
+    return config.provider;
+  }
+  const channel = getOneBotChannelConfig(apiOrCfg);
+  return resolveProvider(channel.provider, process.env.ONEBOT_PROVIDER);
 }
 
 export function listAccountIds(apiOrCfg?: any): string[] {
@@ -210,6 +243,16 @@ export function getGroupIncreaseConfig(apiOrCfg?: any): {
   return {
     enabled: Boolean(groupIncrease.enabled),
     message: typeof groupIncrease.message === "string" ? groupIncrease.message : undefined
+  };
+}
+
+export function getRequestHandlingConfig(apiOrCfg?: any): OneBotRequestHandlingConfig {
+  const channel = getOneBotChannelConfig(apiOrCfg);
+  const requests = channel.requests ?? {};
+  return {
+    autoApproveFriend: Boolean(requests.autoApproveFriend),
+    autoApproveGroupAdd: Boolean(requests.autoApproveGroupAdd),
+    autoApproveGroupInvite: Boolean(requests.autoApproveGroupInvite)
   };
 }
 

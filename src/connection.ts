@@ -25,6 +25,17 @@ const pendingEcho = new Map<string, { resolve: (payload: any) => void; reject: (
 let connectionReadyResolve: (() => void) | null = null;
 let connectionReadyPromise = createReadyPromise();
 
+type OneBotForwardMessageItem = {
+  message?: string | OneBotMessageSegment[];
+  raw_message?: string;
+  sender?: {
+    card?: string;
+    nickname?: string;
+    user_id?: number;
+  };
+  user_id?: number;
+};
+
 function createReadyPromise(): Promise<void> {
   return new Promise<void>((resolve) => {
     connectionReadyResolve = resolve;
@@ -94,7 +105,7 @@ function nextImageTempFile(ext: string): string {
 }
 
 function inferMediaExtension(value: string, fallback = "bin"): string {
-  return value.match(/\.(png|jpg|jpeg|gif|webp|bmp|tiff|tif|mp4|webm|mov|m4v|avi|mkv)(?:\?|$)/i)?.[1]?.toLowerCase() ?? fallback;
+  return value.match(/\.(png|jpg|jpeg|gif|webp|bmp|tiff|tif|mp4|webm|mov|m4v|avi|mkv|mp3|wav|ogg|aac|m4a|flac|amr|silk)(?:\?|$)/i)?.[1]?.toLowerCase() ?? fallback;
 }
 
 function normalizeLocalPath(value: string): string {
@@ -151,21 +162,21 @@ function downloadUrl(url: string): Promise<Buffer> {
   });
 }
 
-async function resolveImageToLocalPath(image: string): Promise<string> {
-  const value = image.trim();
+async function resolveOutboundFileToLocalPath(fileRef: string, fallbackExt = "bin"): Promise<string> {
+  const value = fileRef.trim();
   if (!value) {
-    throw new Error("Empty image");
+    throw new Error("Empty file");
   }
   if (value.startsWith("file://")) {
     return value.slice(7).replace(/\\/g, "/");
   }
   if (value.startsWith("base64://")) {
-    const fullPath = nextImageTempFile("png");
+    const fullPath = nextImageTempFile(fallbackExt);
     writeFileSync(fullPath, Buffer.from(value.slice(9), "base64"));
     return normalizeLocalPath(fullPath);
   }
   if (/^https?:\/\//i.test(value)) {
-    const ext = inferMediaExtension(value, "png");
+    const ext = inferMediaExtension(value, fallbackExt);
     const fullPath = nextImageTempFile(ext);
     writeFileSync(fullPath, await downloadUrl(value));
     return normalizeLocalPath(fullPath);
@@ -362,9 +373,19 @@ export function stopConnection(): void {
 
 type OneBotOutboundMessage = string | OneBotMessageSegment[];
 
-function buildInvalidImageFallbackText(segment: OneBotMessageSegment): string {
+function buildInvalidSegmentFallbackText(segment: OneBotMessageSegment): string {
   const summary = typeof segment.data?.summary === "string" ? segment.data.summary.trim() : "";
-  return summary || "[图片无效]";
+  if (summary) {
+    return summary;
+  }
+  if (segment.type === "file") {
+    const fileName = typeof segment.data?.name === "string" ? segment.data.name.trim() : "";
+    return fileName ? `[文件:${fileName}]` : "[文件无效]";
+  }
+  if (segment.type === "record") {
+    return "[语音无效]";
+  }
+  return "[图片无效]";
 }
 
 async function normalizeOutboundMessage(message: OneBotOutboundMessage): Promise<OneBotOutboundMessage> {
@@ -375,20 +396,23 @@ async function normalizeOutboundMessage(message: OneBotOutboundMessage): Promise
   const logger = getLogger();
   const normalized: OneBotMessageSegment[] = [];
   for (const segment of message) {
-    if (segment.type !== "image") {
+    if (segment.type !== "image" && segment.type !== "record" && segment.type !== "file") {
       normalized.push(segment);
       continue;
     }
 
     const rawFile = typeof segment.data?.file === "string" ? segment.data.file.trim() : "";
     if (!rawFile) {
-      normalized.push({ type: "text", data: { text: buildInvalidImageFallbackText(segment) } });
-      logger.warn?.("[onebot] outbound image skipped: empty file reference");
+      normalized.push({ type: "text", data: { text: buildInvalidSegmentFallbackText(segment) } });
+      logger.warn?.(`[onebot] outbound ${segment.type} skipped: empty file reference`);
       continue;
     }
 
     try {
-      const normalizedFile = await resolveImageToLocalPath(rawFile);
+      const normalizedFile = await resolveOutboundFileToLocalPath(
+        rawFile,
+        segment.type === "image" ? "png" : segment.type === "record" ? "mp3" : inferMediaExtension(rawFile, "bin")
+      );
       normalized.push({
         ...segment,
         data: {
@@ -397,8 +421,8 @@ async function normalizeOutboundMessage(message: OneBotOutboundMessage): Promise
         }
       });
     } catch (error) {
-      logger.warn?.(`[onebot] outbound image fallback: ${formatNestedError(error)} source=${rawFile.slice(0, 200)}`);
-      normalized.push({ type: "text", data: { text: buildInvalidImageFallbackText(segment) } });
+      logger.warn?.(`[onebot] outbound ${segment.type} fallback: ${formatNestedError(error)} source=${rawFile.slice(0, 200)}`);
+      normalized.push({ type: "text", data: { text: buildInvalidSegmentFallbackText(segment) } });
     }
   }
 
@@ -445,6 +469,92 @@ export async function sendGroupMsg(groupId: number, message: OneBotOutboundMessa
   return sendMessage("send_group_msg", { group_id: String(groupId) }, message, getConfig);
 }
 
+export async function sendPoke(params: {
+  getConfig?: () => OneBotAccountConfig | null;
+  groupId?: number;
+  userId: number;
+}): Promise<void> {
+  const config = params.getConfig?.() ?? null;
+  if (config?.provider && config.provider !== "napcat") {
+    throw new Error("OneBot poke action requires provider=napcat");
+  }
+  const socket = params.getConfig ? await ensureConnection(params.getConfig) : await waitForConnection();
+  const res = await sendOneBotAction(socket, "send_poke", {
+    user_id: String(params.userId),
+    group_id: params.groupId != null ? String(params.groupId) : undefined,
+  });
+  assertOk(res, "send_poke");
+}
+
+function assertNapCatProvider(config: OneBotAccountConfig | null, action: string): void {
+  if (config?.provider && config.provider !== "napcat") {
+    throw new Error(`OneBot ${action} requires provider=napcat`);
+  }
+}
+
+export async function setFriendAddRequest(params: {
+  approve: boolean;
+  flag: string;
+  getConfig?: () => OneBotAccountConfig | null;
+  remark?: string;
+}): Promise<void> {
+  const socket = params.getConfig ? await ensureConnection(params.getConfig) : await waitForConnection();
+  const res = await sendOneBotAction(socket, "set_friend_add_request", {
+    flag: params.flag,
+    approve: params.approve,
+    remark: params.remark?.trim() || undefined
+  });
+  assertOk(res, "set_friend_add_request");
+}
+
+export async function setGroupAddRequest(params: {
+  approve: boolean;
+  flag: string;
+  getConfig?: () => OneBotAccountConfig | null;
+  reason?: string;
+  subType: "add" | "invite";
+}): Promise<void> {
+  const socket = params.getConfig ? await ensureConnection(params.getConfig) : await waitForConnection();
+  const res = await sendOneBotAction(socket, "set_group_add_request", {
+    flag: params.flag,
+    sub_type: params.subType,
+    approve: params.approve,
+    reason: params.reason?.trim() || undefined
+  });
+  assertOk(res, "set_group_add_request");
+}
+
+export async function sendForwardMsg(params: {
+  getConfig?: () => OneBotAccountConfig | null;
+  groupId?: number;
+  messages: OneBotMessageSegment[];
+  userId?: number;
+}): Promise<{ messageId?: number; forwardId?: string }> {
+  const config = params.getConfig?.() ?? null;
+  assertNapCatProvider(config, "send_forward_msg");
+
+  const socket = params.getConfig ? await ensureConnection(params.getConfig) : await waitForConnection();
+  const isGroup = params.groupId != null;
+  const groupId = isGroup ? String(params.groupId) : "";
+  const res = await sendOneBotAction(socket, "send_forward_msg", {
+    message_type: isGroup ? "group" : "private",
+    group_id: params.groupId != null ? String(params.groupId) : undefined,
+    user_id: params.userId != null ? String(params.userId) : undefined,
+    messages: params.messages
+  });
+
+  if (groupId && isNapCatGroupSendBlockedResponse(res)) {
+    getLogger().warn?.(`[onebot] group send blocked group=${groupId} action=send_forward_msg`);
+    throw buildGroupSendBlockedError(groupId);
+  }
+
+  assertOk(res, "send_forward_msg");
+  return {
+    messageId: typeof res?.data?.message_id === "number" ? res.data.message_id : undefined,
+    forwardId: typeof res?.data?.res_id === "string" ? res.data.res_id : undefined
+  };
+}
+
 async function sendImageMessage(action: "send_private_msg" | "send_group_msg", params: { user_id?: number | string; group_id?: number | string }, image: string, getConfig?: () => OneBotAccountConfig | null): Promise<number | undefined> {
   return sendMessage(action, params, [{ type: "image", data: { file: image } }], getConfig);
 }
@@ -483,6 +593,51 @@ export async function getImage(file: string, getConfig?: () => OneBotAccountConf
       filename: typeof res.data.filename === "string" ? res.data.filename : undefined,
       url: typeof res.data.url === "string" ? res.data.url : undefined,
     };
+  } catch {
+    return null;
+  }
+}
+
+export async function getForwardMsg(forwardId: string): Promise<{ messages?: OneBotForwardMessageItem[] } | null> {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    return null;
+  }
+  try {
+    const res = await sendOneBotAction(ws, "get_forward_msg", { id: forwardId });
+    assertOk(res, "get_forward_msg");
+    if (!res?.data || typeof res.data !== "object") {
+      return null;
+    }
+
+    const rawMessages = Array.isArray(res.data.messages)
+      ? res.data.messages
+      : Array.isArray(res.data.message)
+        ? res.data.message
+        : null;
+    if (!rawMessages) {
+      return null;
+    }
+
+    return {
+      messages: rawMessages.filter((item: unknown) => Boolean(item && typeof item === "object")) as OneBotForwardMessageItem[]
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function getFile(fileId: string, getConfig?: () => OneBotAccountConfig | null): Promise<Record<string, unknown> | null> {
+  const config = getConfig?.() ?? null;
+  assertNapCatProvider(config, "get_file");
+
+  const socket = getConfig ? await ensureConnection(getConfig) : await waitForConnection();
+  try {
+    const res = await sendOneBotAction(socket, "get_file", {
+      file: fileId,
+      file_id: fileId
+    });
+    assertOk(res, "get_file");
+    return res?.data && typeof res.data === "object" ? res.data as Record<string, unknown> : null;
   } catch {
     return null;
   }

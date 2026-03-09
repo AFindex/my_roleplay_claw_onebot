@@ -1,8 +1,10 @@
 export type OneBotWsType = "forward-websocket" | "backward-websocket";
+export type OneBotProvider = "generic" | "napcat";
 
 export interface OneBotAccountConfig {
   accountId?: string;
   enabled?: boolean;
+  provider?: OneBotProvider;
   type: OneBotWsType;
   host: string;
   port: number;
@@ -12,7 +14,7 @@ export interface OneBotAccountConfig {
 
 export interface OneBotMessageSegment {
   type: string;
-  data?: Record<string, string | number | boolean | undefined>;
+  data?: Record<string, unknown>;
 }
 
 export interface OneBotSender {
@@ -33,7 +35,13 @@ export interface OneBotMessage {
   raw_message?: string;
   message?: string | OneBotMessageSegment[];
   sender?: OneBotSender;
+  comment?: string;
+  duration?: number;
+  file?: Record<string, unknown>;
+  flag?: string;
   notice_type?: string;
   meta_event_type?: string;
+  operator_id?: number;
+  request_type?: string;
+  target_id?: number;
 }
-

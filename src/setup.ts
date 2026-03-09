@@ -25,6 +25,15 @@ function guardCancel<T>(value: T | symbol): T {
 export async function runOneBotSetup(): Promise<void> {
   clackIntro("OneBot 渠道配置");
 
+  const provider = guardCancel(await clackSelect({
+    message: "Provider 类型",
+    options: [
+      { value: "generic", label: "generic（标准 OneBot v11）" },
+      { value: "napcat", label: "napcat（启用 NapCat 私有扩展）" }
+    ],
+    initialValue: process.env.ONEBOT_PROVIDER?.trim().toLowerCase() === "napcat" ? "napcat" : "generic"
+  }));
+
   const type = guardCancel(await clackSelect({
     message: "连接类型",
     options: [
@@ -80,6 +89,7 @@ export async function runOneBotSetup(): Promise<void> {
       onebot: {
         ...(existing.channels?.onebot ?? {}),
         enabled: true,
+        provider,
         type,
         host: String(host).trim(),
         port,
@@ -95,4 +105,3 @@ export async function runOneBotSetup(): Promise<void> {
   writeFileSync(CONFIG_PATH, JSON.stringify(next, null, 2), "utf-8");
   clackOutro(`配置已保存到 ${CONFIG_PATH}`);
 }
-

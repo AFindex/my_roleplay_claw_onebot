@@ -40,6 +40,8 @@
   "scripts": {
     "build": "tsc",
     "test:connect": "tsx scripts/test-connect.ts",
+    "test:live:group": "tsx scripts/test-live-group.ts",
+    "test:live:group:362611039": "tsx scripts/test-live-group.ts --group 362611039",
     "dev:link": "openclaw plugins install -l .",
     "dev:gateway": "openclaw gateway run --verbose --force",
     "dev:logs": "openclaw logs --follow",

@@ -1,25 +1,112 @@
 import { getAsyncReplyConfig, getGroupIncreaseConfig, getOneBotConfig, getRequireMention } from "../config.js";
-import { getMsg, isKnownNapCatGroupSendBlockedError } from "../connection.js";
-import { getImageSegments, getReadableRawText, getReadableTextFromMessageContent, getReplyMessageId, getTextFromSegments, getVideoSegments, isMentioned } from "../message.js";
+import { getForwardMsg, getMsg, isKnownNapCatGroupSendBlockedError } from "../connection.js";
+import { getForwardSegmentIds, getImageSegments, getReadableRawText, getReadableTextFromMessageContent, getReplyMessageId, getTextFromSegments, getVideoSegments, isMentioned } from "../message.js";
 import type { OneBotMessage } from "../types.js";
 import { handleAsyncTrigger, resolveAsyncTaskUntrustedContext, resolveAsyncTrigger } from "./process-inbound-async.js";
 import { handleGroupIncrease } from "./group-increase.js";
 import { dispatchReply, sendFailureMessage } from "./process-inbound-reply.js";
 import {
-  buildCanonicalSessionKey,
   buildInboundContext,
+  dedupeInboundFileAttachments,
   buildMediaPlaceholder,
-  buildOneBotSessionKey,
   dedupeInboundMediaAttachments,
-  migrateLegacySessionStoreKey,
   recordInboundSession,
+  resolveInboundSessionRoute,
+  resolveInboundFileAttachments,
   resolveGroupName,
   resolveInboundMediaAttachments,
   resolveSenderIdentity,
+  type InboundFileAttachment,
   type InboundMediaAttachment,
   type ReplyTarget
 } from "./process-inbound-shared.js";
 import { handleGroupSummaryCommand } from "./process-inbound-summary.js";
+
+const FORWARD_PREVIEW_CHAR_LIMIT = 800;
+const FORWARD_PREVIEW_MAX_ITEMS = 2;
+
+function clipForwardPreview(text: string): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (!normalized || normalized.length <= FORWARD_PREVIEW_CHAR_LIMIT) {
+    return normalized;
+  }
+  return `${normalized.slice(0, Math.max(0, FORWARD_PREVIEW_CHAR_LIMIT - 1)).trimEnd()}…`;
+}
+
+function appendForwardPreview(baseText: string, previewText: string): string {
+  const normalizedBase = baseText.trim();
+  const normalizedPreview = previewText.trim();
+  if (!normalizedPreview) {
+    return normalizedBase;
+  }
+  if (!normalizedBase) {
+    return normalizedPreview;
+  }
+  return `${normalizedBase}\n[合并转发内容]\n${normalizedPreview}`;
+}
+
+function buildFilePlaceholder(fileAttachments: InboundFileAttachment[]): string {
+  if (fileAttachments.length === 0) {
+    return "";
+  }
+  if (fileAttachments.length === 1) {
+    return fileAttachments[0]?.name?.trim()
+      ? `[文件:${fileAttachments[0].name.trim()}]`
+      : "[文件]";
+  }
+  return `（发送了 ${fileAttachments.length} 个文件）`;
+}
+
+function buildForwardNodePreview(node: {
+  message?: OneBotMessage["message"];
+  raw_message?: string;
+  sender?: { card?: string; nickname?: string; user_id?: number };
+  user_id?: number;
+}, selfId: number): string {
+  const sender = node.sender?.card?.trim()
+    || node.sender?.nickname?.trim()
+    || (node.sender?.user_id != null ? String(node.sender.user_id) : "")
+    || (node.user_id != null ? String(node.user_id) : "");
+  const readable = getReadableTextFromMessageContent(
+    node.message ?? node.raw_message,
+    { selfId }
+  ).trim();
+  if (!readable) {
+    return "";
+  }
+  return sender ? `${sender}：${readable}` : readable;
+}
+
+async function resolveForwardPreview(content: OneBotMessage["message"], selfId: number): Promise<string> {
+  const syntheticMessage: OneBotMessage = {
+    post_type: "message",
+    message: content,
+    raw_message: typeof content === "string" ? content : undefined
+  };
+  const forwardIds = getForwardSegmentIds(syntheticMessage).slice(0, FORWARD_PREVIEW_MAX_ITEMS);
+  if (forwardIds.length === 0) {
+    return "";
+  }
+
+  const previews: string[] = [];
+  for (const forwardId of forwardIds) {
+    const forwarded = await getForwardMsg(forwardId);
+    for (const node of forwarded?.messages ?? []) {
+      const readable = buildForwardNodePreview(node, selfId);
+      if (readable) {
+        previews.push(readable);
+      }
+    }
+  }
+
+  if (previews.length === 0) {
+    return "";
+  }
+
+  return clipForwardPreview(
+    previews.slice(0, FORWARD_PREVIEW_MAX_ITEMS * 4).join("\n")
+  );
+}
 
 export async function processInboundMessage(api: any, msg: OneBotMessage): Promise<void> {
   const runtime = api.runtime;
@@ -41,24 +128,41 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
 
   const imageSegments = getImageSegments(msg);
   const videoSegments = getVideoSegments(msg);
-  const currentInboundMedia = await resolveInboundMediaAttachments(api, msg, () => config);
+  const [currentInboundMedia, currentInboundFiles] = await Promise.all([
+    resolveInboundMediaAttachments(api, msg, () => config),
+    resolveInboundFileAttachments(api, msg, () => config)
+  ]);
   const wasMentioned = isMentioned(msg, selfId);
 
   const replyId = getReplyMessageId(msg);
   let quotedInboundMedia: InboundMediaAttachment[] = [];
+  let quotedInboundFiles: InboundFileAttachment[] = [];
   let messageText: string;
   if (replyId != null) {
-    const currentText = getReadableRawText(msg, { selfId });
+    const currentText = appendForwardPreview(
+      getReadableRawText(msg, { selfId }),
+      await resolveForwardPreview(msg.message, selfId)
+    );
     try {
       const quoted = await getMsg(replyId);
       if (quoted?.message) {
-        quotedInboundMedia = await resolveInboundMediaAttachments(api, {
-          post_type: "message",
-          message: quoted.message,
-          raw_message: typeof quoted.message === "string" ? quoted.message : undefined
-        }, () => config);
+        [quotedInboundMedia, quotedInboundFiles] = await Promise.all([
+          resolveInboundMediaAttachments(api, {
+            post_type: "message",
+            message: quoted.message,
+            raw_message: typeof quoted.message === "string" ? quoted.message : undefined
+          }, () => config),
+          resolveInboundFileAttachments(api, {
+            post_type: "message",
+            message: quoted.message,
+            raw_message: typeof quoted.message === "string" ? quoted.message : undefined
+          }, () => config)
+        ]);
       }
-      const quotedText = getReadableTextFromMessageContent(quoted?.message, { selfId });
+      const quotedText = appendForwardPreview(
+        getReadableTextFromMessageContent(quoted?.message, { selfId }),
+        await resolveForwardPreview(quoted?.message, selfId)
+      );
       const senderLabel = quoted?.sender?.nickname ?? quoted?.sender?.user_id ?? "某人";
       messageText = quotedText
         ? `[引用 ${String(senderLabel)} 的消息：${quotedText}]\n${currentText}`
@@ -67,16 +171,24 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
       messageText = currentText;
     }
   } else {
-    messageText = getReadableRawText(msg, { selfId });
+    messageText = appendForwardPreview(
+      getReadableRawText(msg, { selfId }),
+      await resolveForwardPreview(msg.message, selfId)
+    );
   }
 
   const inboundMedia = dedupeInboundMediaAttachments([currentInboundMedia, quotedInboundMedia]);
+  const inboundFiles = dedupeInboundFileAttachments([currentInboundFiles, quotedInboundFiles]);
 
   if (!messageText.trim() && (imageSegments.length > 0 || videoSegments.length > 0)) {
     messageText = buildMediaPlaceholder({
       imageCount: imageSegments.length,
       videoCount: videoSegments.length
     });
+  }
+
+  if (!messageText.trim() && inboundFiles.length > 0) {
+    messageText = buildFilePlaceholder(inboundFiles);
   }
 
   if (!messageText.trim() || !msg.user_id) {
@@ -118,29 +230,9 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
     senderName: senderIdentity.senderName,
     userId
   };
-  const legacySessionKey = buildOneBotSessionKey(replyTarget);
-
-  const route = runtime.channel.routing?.resolveAgentRoute?.({
-    cfg: api.config,
-    channel: "onebot",
+  const { agentId, sessionKey, storePath } = resolveInboundSessionRoute(api, runtime, {
     accountId: config.accountId ?? "default",
-    peer: {
-      kind: isGroup ? "group" : "direct",
-      id: String(isGroup ? groupId : userId)
-    }
-  }) ?? { agentId: "main" };
-  const agentId = route.agentId ?? "main";
-  const sessionKey = buildCanonicalSessionKey(agentId, replyTarget);
-
-  const storePath = runtime.channel.session?.resolveStorePath?.(api.config?.session?.store, {
-    agentId: route.agentId
-  }) ?? "";
-
-  migrateLegacySessionStoreKey({
-    canonicalKey: sessionKey,
-    legacyKey: legacySessionKey,
-    logger: api.logger,
-    storePath
+    replyTarget
   });
 
   if (runtime.channel.activity?.record) {
@@ -196,6 +288,7 @@ export async function processInboundMessage(api: any, msg: OneBotMessage): Promi
 
   const ctxPayload = buildInboundContext(api, runtime, {
     commandText: triggerText,
+    fileAttachments: inboundFiles,
     mediaAttachments: inboundMedia,
     messageText,
     replyTarget,

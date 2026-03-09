@@ -1,10 +1,11 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import path from "node:path";
 
 import { getOneBotConfig } from "../config.js";
-import { getGroupInfo, getGroupMemberInfo, getImage, getStrangerInfo, stageInboundMediaToLocalPath } from "../connection.js";
+import { getFile, getGroupInfo, getGroupMemberInfo, getImage, getStrangerInfo, stageInboundMediaToLocalPath } from "../connection.js";
 import { collapseDoubleNewlines } from "../markdown.js";
 import { appendSessionAssistantMessage, appendSessionUserMessage } from "../session-transcript-mirror.js";
-import { getImageSegments, getVideoSegments } from "../message.js";
+import { getFileSegments, getImageSegments, getVideoSegments } from "../message.js";
 import type { OneBotMessage } from "../types.js";
 
 const ASYNC_TASK_CONTEXT_CHAR_LIMIT = 6000;
@@ -29,6 +30,22 @@ export type InboundMediaAttachment = {
   kind: "image" | "video";
   mime: string;
   path: string;
+};
+
+export type InboundFileAttachment = {
+  kind: "file";
+  id?: string;
+  mime: string;
+  name?: string;
+  path: string;
+  sizeBytes?: number;
+};
+
+export type ResolvedOneBotSessionRoute = {
+  agentId: string;
+  route: { agentId?: string };
+  sessionKey: string;
+  storePath: string;
 };
 
 type TranscriptExcerptItem = {
@@ -131,6 +148,88 @@ function inferVideoMime(value?: string): string {
   if (normalized.endsWith(".avi")) return "video/x-msvideo";
   if (normalized.endsWith(".mkv")) return "video/x-matroska";
   return "video/*";
+}
+
+function inferFileMime(value?: string): string {
+  const normalized = value?.trim().toLowerCase() ?? "";
+  if (!normalized) {
+    return "application/octet-stream";
+  }
+  if (normalized.startsWith("text/") || normalized.startsWith("application/") || normalized.startsWith("audio/")) {
+    return normalized;
+  }
+  if (normalized.endsWith(".pdf")) return "application/pdf";
+  if (normalized.endsWith(".txt")) return "text/plain";
+  if (normalized.endsWith(".md")) return "text/markdown";
+  if (normalized.endsWith(".json")) return "application/json";
+  if (normalized.endsWith(".csv")) return "text/csv";
+  if (normalized.endsWith(".zip")) return "application/zip";
+  if (normalized.endsWith(".7z")) return "application/x-7z-compressed";
+  if (normalized.endsWith(".rar")) return "application/vnd.rar";
+  if (normalized.endsWith(".doc")) return "application/msword";
+  if (normalized.endsWith(".docx")) return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  if (normalized.endsWith(".xls")) return "application/vnd.ms-excel";
+  if (normalized.endsWith(".xlsx")) return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+  if (normalized.endsWith(".ppt")) return "application/vnd.ms-powerpoint";
+  if (normalized.endsWith(".pptx")) return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+  if (normalized.endsWith(".mp3")) return "audio/mpeg";
+  if (normalized.endsWith(".wav")) return "audio/wav";
+  return "application/octet-stream";
+}
+
+function normalizePositiveInteger(value: unknown): number | undefined {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return undefined;
+  }
+  return Math.trunc(numeric);
+}
+
+function normalizeFileName(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const normalized = value.trim();
+  return normalized || undefined;
+}
+
+function basenameFromValue(value: string): string | undefined {
+  const normalized = value.trim();
+  if (!normalized) {
+    return undefined;
+  }
+
+  if (/^https?:\/\//i.test(normalized)) {
+    try {
+      const pathname = new URL(normalized).pathname;
+      const basename = pathname.split("/").pop()?.trim();
+      return basename || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  const basename = path.basename(normalized).trim();
+  return basename || undefined;
+}
+
+function buildFileAttachmentContextBlock(fileAttachments: InboundFileAttachment[]): string | undefined {
+  if (fileAttachments.length === 0) {
+    return undefined;
+  }
+
+  return [
+    "OneBot file attachments (untrusted metadata):",
+    "```json",
+    JSON.stringify(fileAttachments.map((item) => ({
+      id: item.id,
+      mime: item.mime,
+      name: item.name,
+      path: item.path,
+      sizeBytes: item.sizeBytes
+    })), null, 2),
+    "```"
+  ].join("\n");
 }
 
 function appendOriginalSessionUserMirror(params: {
@@ -319,6 +418,24 @@ export function dedupeInboundMediaAttachments(lists: InboundMediaAttachment[][])
   return merged;
 }
 
+export function dedupeInboundFileAttachments(lists: InboundFileAttachment[][]): InboundFileAttachment[] {
+  const merged: InboundFileAttachment[] = [];
+  const seen = new Set<string>();
+
+  for (const list of lists) {
+    for (const attachment of list) {
+      const key = `${attachment.path}:${attachment.name ?? ""}:${attachment.id ?? ""}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      merged.push(attachment);
+    }
+  }
+
+  return merged;
+}
+
 export async function resolveInboundMediaAttachments(
   api: any,
   msg: OneBotMessage,
@@ -376,6 +493,83 @@ export async function resolveInboundMediaAttachments(
   return attachments;
 }
 
+export async function resolveInboundFileAttachmentFromData(
+  api: any,
+  data: Record<string, unknown>,
+  getConfig: () => ReturnType<typeof getOneBotConfig>
+): Promise<InboundFileAttachment | null> {
+  const directSource = pickFirstString(
+    data.url,
+    data.src,
+    data.path,
+    data.local_path,
+    data.file_url,
+    data.fileUrl
+  );
+  const fileRef = pickFirstString(data.file_id, data.file, data.id);
+  let source = directSource;
+  let name = normalizeFileName(
+    pickFirstString(data.name, data.file_name, data.filename, data.fileName)
+  );
+  let sizeBytes = normalizePositiveInteger(data.size ?? data.file_size);
+
+  if (!source && fileRef) {
+    if (looksLikeDirectMediaReference(fileRef)) {
+      source = fileRef;
+    } else {
+      const resolved = await getFile(fileRef, getConfig).catch(() => null);
+      source = pickFirstString(resolved?.file, resolved?.url, resolved?.path, resolved?.local_path);
+      name = name ?? normalizeFileName(
+        pickFirstString(resolved?.name, resolved?.file_name, resolved?.filename, resolved?.fileName)
+      );
+      sizeBytes = sizeBytes ?? normalizePositiveInteger(resolved?.size ?? resolved?.file_size);
+    }
+  }
+
+  if (!source) {
+    return null;
+  }
+
+  const finalName = name ?? basenameFromValue(source) ?? basenameFromValue(fileRef ?? "") ?? undefined;
+  try {
+    const stagedPath = await stageInboundMediaToLocalPath(source, path.extname(finalName ?? source).replace(/^\./, "") || "bin");
+    return {
+      kind: "file",
+      id: fileRef,
+      mime: inferFileMime(pickFirstString(data.mimetype, data.mime, data.contentType, finalName, source)),
+      name: finalName,
+      path: stagedPath,
+      sizeBytes
+    };
+  } catch (error) {
+    api.logger?.warn?.(`[onebot] inbound file staging failed: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  }
+}
+
+export async function resolveInboundFileAttachments(
+  api: any,
+  msg: OneBotMessage,
+  getConfig: () => ReturnType<typeof getOneBotConfig>
+): Promise<InboundFileAttachment[]> {
+  const segments = getFileSegments(msg);
+  if (segments.length === 0) {
+    return [];
+  }
+
+  const attachments: InboundFileAttachment[] = [];
+  for (const segment of segments) {
+    const attachment = await resolveInboundFileAttachmentFromData(api, segment.data ?? {}, getConfig);
+    if (attachment) {
+      attachments.push(attachment);
+    } else {
+      api.logger?.warn?.(`[onebot] inbound file skipped: missing usable source (${JSON.stringify(segment.data ?? {})})`);
+    }
+  }
+
+  return dedupeInboundFileAttachments([attachments]);
+}
+
 export function buildOneBotSessionKey(target: ReplyTarget): string {
   return target.isGroup ? `onebot:group:${target.groupId}` : `onebot:user:${target.userId}`;
 }
@@ -383,6 +577,42 @@ export function buildOneBotSessionKey(target: ReplyTarget): string {
 export function buildCanonicalSessionKey(agentId: string, target: ReplyTarget): string {
   const normalizedAgentId = agentId.trim().toLowerCase() || "main";
   return `agent:${normalizedAgentId}:${buildOneBotSessionKey(target)}`;
+}
+
+export function resolveInboundSessionRoute(api: any, runtime: any, params: {
+  accountId: string;
+  replyTarget: ReplyTarget;
+}): ResolvedOneBotSessionRoute {
+  const route = runtime.channel.routing?.resolveAgentRoute?.({
+    cfg: api.config,
+    channel: "onebot",
+    accountId: params.accountId,
+    peer: {
+      kind: params.replyTarget.isGroup ? "group" : "direct",
+      id: String(params.replyTarget.isGroup
+        ? params.replyTarget.groupId ?? params.replyTarget.userId
+        : params.replyTarget.userId)
+    }
+  }) ?? { agentId: "main" };
+  const agentId = route.agentId ?? "main";
+  const sessionKey = buildCanonicalSessionKey(agentId, params.replyTarget);
+  const storePath = runtime.channel.session?.resolveStorePath?.(api.config?.session?.store, {
+    agentId: route.agentId
+  }) ?? "";
+
+  migrateLegacySessionStoreKey({
+    canonicalKey: sessionKey,
+    legacyKey: buildOneBotSessionKey(params.replyTarget),
+    logger: api.logger,
+    storePath
+  });
+
+  return {
+    agentId,
+    route,
+    sessionKey,
+    storePath
+  };
 }
 
 export function migrateLegacySessionStoreKey(params: {
@@ -434,6 +664,7 @@ export function buildAsyncSessionKey(agentId: string, target: ReplyTarget, kind:
 
 export function buildInboundContext(api: any, runtime: any, params: {
   commandText?: string;
+  fileAttachments?: InboundFileAttachment[];
   mediaAttachments?: InboundMediaAttachment[];
   messageText: string;
   replyTarget: ReplyTarget;
@@ -441,12 +672,13 @@ export function buildInboundContext(api: any, runtime: any, params: {
   untrustedContext?: string[];
   wasMentioned?: boolean;
 }): Record<string, unknown> {
-  const { commandText, mediaAttachments = [], messageText, replyTarget, sessionKey, untrustedContext, wasMentioned } = params;
+  const { commandText, fileAttachments = [], mediaAttachments = [], messageText, replyTarget, sessionKey, untrustedContext, wasMentioned } = params;
   const envelopeOptions = runtime.channel.reply?.resolveEnvelopeFormatOptions?.(api.config) ?? {};
   const agentBody = replyTarget.isGroup ? `${replyTarget.senderLabel}: ${messageText}` : messageText;
   const groupContextBlocks = [
     buildGroupInfoContextBlock(replyTarget),
     buildGroupSenderContextBlock(replyTarget),
+    buildFileAttachmentContextBlock(fileAttachments),
   ].filter((item): item is string => typeof item === "string" && item.trim().length > 0);
   const mergedUntrustedContext = [
     ...groupContextBlocks,
@@ -464,6 +696,9 @@ export function buildInboundContext(api: any, runtime: any, params: {
 
   const mediaPaths = mediaAttachments.length > 0 ? mediaAttachments.map((item) => item.path) : undefined;
   const mediaTypes = mediaAttachments.length > 0 ? mediaAttachments.map((item) => item.mime) : undefined;
+  const filePaths = fileAttachments.length > 0 ? fileAttachments.map((item) => item.path) : undefined;
+  const fileTypes = fileAttachments.length > 0 ? fileAttachments.map((item) => item.mime) : undefined;
+  const fileNames = fileAttachments.length > 0 ? fileAttachments.map((item) => item.name).filter((item): item is string => Boolean(item)) : undefined;
 
   const ctxPayload = {
     Body: body,
@@ -491,6 +726,14 @@ export function buildInboundContext(api: any, runtime: any, params: {
     MediaPaths: mediaPaths,
     MediaUrls: mediaPaths,
     MediaTypes: mediaTypes,
+    FilePath: filePaths?.[0],
+    FilePaths: filePaths,
+    FileUrl: filePaths?.[0],
+    FileUrls: filePaths,
+    FileType: fileTypes?.[0],
+    FileTypes: fileTypes,
+    FileName: fileNames?.[0],
+    FileNames: fileNames,
     OriginatingChannel: "onebot",
     OriginatingTo: replyTarget.replyTarget,
     CommandAuthorized: true,
@@ -509,7 +752,14 @@ export function buildInboundContext(api: any, runtime: any, params: {
         card: replyTarget.senderCard,
         label: replyTarget.senderLabel,
         name: replyTarget.senderName,
-      }
+      },
+      files: fileAttachments.length > 0 ? fileAttachments.map((item) => ({
+        id: item.id,
+        mime: item.mime,
+        name: item.name,
+        path: item.path,
+        sizeBytes: item.sizeBytes
+      })) : undefined
     }
   };
 

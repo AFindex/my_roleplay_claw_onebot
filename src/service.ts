@@ -1,7 +1,6 @@
 import { getOneBotConfig } from "./config.js";
 import { connectForward, createServerAndWait, handleEchoResponse, setWs, startImageTempCleanup, stopConnection, stopImageTempCleanup } from "./connection.js";
-import { handleGroupIncrease } from "./handlers/group-increase.js";
-import { processInboundMessage } from "./handlers/process-inbound.js";
+import { processOneBotEvent } from "./handlers/process-event.js";
 import type { OneBotMessage } from "./types.js";
 
 export function registerService(api: any): void {
@@ -29,18 +28,9 @@ export function registerService(api: any): void {
             if (payload.meta_event_type === "heartbeat") return;
 
             const msg = payload as OneBotMessage;
-            if (msg.post_type === "message" && (msg.message_type === "private" || msg.message_type === "group")) {
-              processInboundMessage(api, msg).catch((error) => {
-                api.logger?.error?.(`[onebot] processInboundMessage failed: ${error instanceof Error ? error.message : String(error)}`);
-              });
-              return;
-            }
-
-            if (msg.post_type === "notice" && msg.notice_type === "group_increase") {
-              handleGroupIncrease(api, msg).catch((error) => {
-                api.logger?.error?.(`[onebot] handleGroupIncrease failed: ${error instanceof Error ? error.message : String(error)}`);
-              });
-            }
+            processOneBotEvent(api, msg).catch((error) => {
+              api.logger?.error?.(`[onebot] processOneBotEvent failed: ${error instanceof Error ? error.message : String(error)}`);
+            });
           } catch (error) {
             api.logger?.error?.(`[onebot] parse message failed: ${error instanceof Error ? error.message : String(error)}`);
           }
@@ -67,4 +57,3 @@ export function registerService(api: any): void {
     }
   });
 }
-
