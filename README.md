@@ -33,6 +33,9 @@ npm run build
 # 第一次只需要执行一次，把当前仓库链接到默认 profile
 npm run dev:link
 
+# 第一次接 OneBot，或改了 host / port / token 后，先写入渠道配置
+openclaw onebot setup
+
 # 之后每次改完插件代码，直接重启默认 gateway
 openclaw gateway restart
 ```
@@ -54,6 +57,7 @@ npm run dev:logs
 
 - 改 `src/**/*.ts`：直接执行 `openclaw gateway restart`
 - 改 `skills/**`：通常下一次 agent turn 就会读取到
+- 改 OneBot 连接参数（尤其 host / port / accessToken）：先执行 `openclaw onebot setup`
 - 改 `channels.onebot` 配置：通常重启一次 Gateway 最稳
 - 发布前：仍然可以执行 `npm run build`
 
@@ -64,6 +68,13 @@ npm run dev:logs
 ```bash
 openclaw onebot setup
 ```
+
+这是当前最推荐的配置入口。首次接入、切换 OneBot 地址、修改 token 后，都先跑一次这个命令。
+
+如果你忘了执行这一步，最常见的现象是：
+
+- `npm run test:connect` 里看到 `accessTokenSource: 'unset'`
+- 服务端返回 `token验证失败`
 
 也可以在 `openclaw.json` 中写入：
 
@@ -100,8 +111,17 @@ openclaw message send --channel onebot --target group:987654321 --media "file://
 ## 测试连接
 
 ```bash
-cp .env.example .env
+# 首次配置或改了 token / host / port 后，先执行这个
+openclaw onebot setup
+
+# 再验证连接
 npm run test:connect
+```
+
+如果你明确想走环境变量方式，再额外使用：
+
+```bash
+cp .env.example .env
 ```
 
 ## 内置 Skill

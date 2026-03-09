@@ -1,19 +1,17 @@
-let activeReplyTarget: string | null = null;
+import { AsyncLocalStorage } from "node:async_hooks";
 
-export function setActiveReplyTarget(to: string): void {
-  activeReplyTarget = to;
-}
-
-export function clearActiveReplyTarget(): void {
-  activeReplyTarget = null;
-}
+const replyTargetStore = new AsyncLocalStorage<string>();
 
 function normalizeTarget(value: string): string {
   return value.replace(/^(onebot|qq|lagrange):/i, "").trim().toLowerCase();
 }
 
+export function withReplyTarget<T>(to: string, run: () => T): T {
+  return replyTargetStore.run(to, run);
+}
+
 export function resolveTargetForReply(to: string): string {
-  const stored = activeReplyTarget;
+  const stored = replyTargetStore.getStore();
   if (!stored) return to;
   const storedNormalized = normalizeTarget(stored);
   const groupMatch = storedNormalized.match(/^group:(\d+)$/);
@@ -26,4 +24,3 @@ export function resolveTargetForReply(to: string): string {
   }
   return to;
 }
-

@@ -84,11 +84,13 @@ export const OneBotChannelPlugin = {
         return { channel: "onebot", ok: false, messageId: "", error: new Error("OneBot not configured") };
       }
       const result = await sendTextMessage(to, text, () => getOneBotConfig(api), cfg);
+      if (!result.ok) {
+        throw new Error(result.error || "OneBot send failed");
+      }
       return {
         channel: "onebot",
-        ok: result.ok,
+        ok: true,
         messageId: result.messageId ?? "",
-        error: result.error ? new Error(result.error) : undefined
       };
     },
     sendMedia: async ({ to, mediaUrl, text, cfg }: { to: string; mediaUrl: string; text?: string; cfg?: any }) => {
@@ -98,13 +100,14 @@ export const OneBotChannelPlugin = {
         return { channel: "onebot", ok: false, messageId: "", error: new Error("OneBot not configured") };
       }
       const result = await sendMediaMessage(to, mediaUrl, text, () => getOneBotConfig(api), cfg);
+      if (!result.ok) {
+        throw new Error(result.error || "OneBot send failed");
+      }
       return {
         channel: "onebot",
-        ok: result.ok,
+        ok: true,
         messageId: result.messageId ?? "",
-        error: result.error ? new Error(result.error) : undefined
       };
     }
   }
 };
-

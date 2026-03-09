@@ -8,9 +8,12 @@
 npm install
 npm run build
 npm run dev:link
+openclaw onebot setup
 ```
 
 `npm run dev:link` 只需要第一次执行一次，用来把当前仓库链接成 OpenClaw 插件。
+
+`openclaw onebot setup` 也应该在首次接入时执行一次；之后如果你改了 OneBot 的 host / port / accessToken，也先重新执行这个命令。
 
 ## 日常开发
 
@@ -27,6 +30,9 @@ openclaw gateway restart
 ```bash
 # 看 Gateway 服务状态
 openclaw gateway status
+
+# 重写 OneBot 渠道配置（首次接入、改 token 时优先做）
+openclaw onebot setup
 
 # 测试 OneBot 连接
 npm run test:connect
@@ -45,13 +51,21 @@ napcat status 2932043832
 如果 `napcat status` 显示没在运行，那么先恢复 OneBot 服务，再执行：
 
 ```bash
+openclaw onebot setup
 openclaw gateway restart
 npm run test:connect
 ```
 
+如果 `npm run test:connect` 里出现下面这些信号，也优先先跑一遍 `openclaw onebot setup`：
+
+- `accessTokenSource: 'unset'`
+- `token验证失败`
+- host / port 明显不是你预期的值
+
 ## 最短流程
 
 ```bash
+openclaw onebot setup
 openclaw gateway restart
 npm run test:connect
 ```
@@ -60,4 +74,5 @@ npm run test:connect
 
 - 插件入口是 `src/index.ts`
 - `scripts/test-connect.ts` 会优先读取默认 OpenClaw 配置里的 OneBot 参数
+- 如果你忘了执行 `openclaw onebot setup`，`test:connect` 很容易直接暴露成 token / host / port 不对
 - 如果只是改 `skills/**`，通常下一次 agent turn 就会生效

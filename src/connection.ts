@@ -11,6 +11,8 @@ const OPENCLAW_STATE_DIR = (process.env.OPENCLAW_STATE_DIR ?? "").trim() || join
 const IMAGE_TEMP_DIR = join(OPENCLAW_STATE_DIR, "media", "my-claw-onebot");
 const IMAGE_TEMP_MAX_AGE_MS = 60 * 60 * 1000;
 const IMAGE_TEMP_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
+const GROUP_SEND_BLOCK_ERROR_PREFIX = "NapCat group send blocked";
+const NAPCAT_GROUP_SEND_BLOCK_PATTERN = /NodeIKernelMsgService\/sendMsg[\s\S]*"result"\s*:\s*120/i;
 
 let ws: WebSocket | null = null;
 let wsServer: WebSocketServer | null = null;
@@ -42,6 +44,25 @@ function getLogger(): { info?: (value: string) => void; warn?: (value: string) =
 function nextEcho(): string {
   echoCounter += 1;
   return `onebot-${Date.now()}-${echoCounter}`;
+}
+
+function extractOneBotFailureReason(res: any): string {
+  const reason = [res?.wording, res?.message, res?.msg].find((item) => typeof item === "string" && item.trim());
+  return typeof reason === "string" ? reason.trim() : "";
+}
+
+function buildGroupSendBlockedError(groupId: string): Error {
+  return new Error(
+    `${GROUP_SEND_BLOCK_ERROR_PREFIX}: group=${groupId} result=120. QQ/NapCat is rejecting this group send.`
+  );
+}
+
+function isNapCatGroupSendBlockedResponse(res: any): boolean {
+  return res?.retcode === 1200 && NAPCAT_GROUP_SEND_BLOCK_PATTERN.test(extractOneBotFailureReason(res));
+}
+
+export function isKnownNapCatGroupSendBlockedError(error: unknown): boolean {
+  return error instanceof Error && error.message.startsWith(`${GROUP_SEND_BLOCK_ERROR_PREFIX}:`);
 }
 
 function cleanupImageTemp(): void {
@@ -385,15 +406,35 @@ async function normalizeOutboundMessage(message: OneBotOutboundMessage): Promise
 }
 
 async function sendMessage(action: "send_private_msg" | "send_group_msg", params: { user_id?: number | string; group_id?: number | string }, message: OneBotOutboundMessage, getConfig?: () => OneBotAccountConfig | null): Promise<number | undefined> {
+  const groupId = params.group_id != null ? String(params.group_id) : "";
   const socket = getConfig ? await ensureConnection(getConfig) : await waitForConnection();
-  const res = await sendOneBotAction(socket, action, {
+  const outboundMessage = await normalizeOutboundMessage(message);
+  const actionParams = {
     ...params,
     user_id: params.user_id != null ? String(params.user_id) : undefined,
     group_id: params.group_id != null ? String(params.group_id) : undefined,
-    message: await normalizeOutboundMessage(message)
-  });
-  assertOk(res, action);
-  return res?.data?.message_id as number | undefined;
+    message: outboundMessage
+  };
+
+  try {
+    const res = await sendOneBotAction(socket, action, actionParams);
+    if (groupId && isNapCatGroupSendBlockedResponse(res)) {
+      getLogger().warn?.(`[onebot] group send blocked group=${groupId} action=${action}`);
+      throw buildGroupSendBlockedError(groupId);
+    }
+
+    assertOk(res, action);
+    return res?.data?.message_id as number | undefined;
+  } catch (error) {
+    if (groupId && !isKnownNapCatGroupSendBlockedError(error)) {
+      const reason = error instanceof Error ? error.message : String(error);
+      if (NAPCAT_GROUP_SEND_BLOCK_PATTERN.test(reason)) {
+        getLogger().warn?.(`[onebot] group send blocked group=${groupId} action=${action}`);
+        throw buildGroupSendBlockedError(groupId);
+      }
+    }
+    throw error;
+  }
 }
 
 export async function sendPrivateMsg(userId: number, message: OneBotOutboundMessage, getConfig?: () => OneBotAccountConfig | null): Promise<number | undefined> {
