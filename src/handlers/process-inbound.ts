@@ -657,6 +657,78 @@ function buildCapturedReplyText(captured: CapturedReply): string {
   }).join("")).trim();
 }
 
+function isMentionOnlyCapturedReply(captured: CapturedReply): boolean {
+  return captured.parts.length > 0 && captured.parts.every((part) => part.type === "mention");
+}
+
+function appendCapturedReplyState(target: CapturedReply, source: CapturedReply): void {
+  for (const part of source.parts) {
+    if (part.type === "image") {
+      const mediaUrl = part.mediaUrl.trim();
+      if (mediaUrl && !target.mediaUrls.includes(mediaUrl)) {
+        target.mediaUrls.push(mediaUrl);
+      }
+      target.parts.push({ type: "image", mediaUrl: part.mediaUrl });
+      continue;
+    }
+
+    if (part.type === "mention") {
+      target.parts.push({ type: "mention", target: part.target });
+      continue;
+    }
+
+    target.parts.push({ type: "text", text: part.text });
+    if (part.text.trim()) {
+      target.textParts.push(part.text.trim());
+    }
+  }
+}
+
+function previewReplyPayloadForLog(payload: ReplyPayload): string {
+  if (typeof payload === "string") {
+    return `kind=string text=${JSON.stringify(previewTextForLog(payload, 160))}`;
+  }
+
+  const parts = [
+    typeof payload.text === "string" ? `text=${JSON.stringify(previewTextForLog(payload.text, 120))}` : "",
+    typeof payload.body === "string" ? `body=${JSON.stringify(previewTextForLog(payload.body, 120))}` : "",
+    typeof payload.mediaUrl === "string" ? `mediaUrl=${JSON.stringify(previewTextForLog(payload.mediaUrl, 120))}` : "",
+    Array.isArray(payload.mediaUrls) && payload.mediaUrls.length > 0 ? `mediaUrls=${payload.mediaUrls.length}` : ""
+  ].filter(Boolean);
+
+  return parts.length > 0 ? parts.join(" ") : "kind=object empty=true";
+}
+
+function previewCapturedReplyForLog(captured: CapturedReply): string {
+  const text = buildCapturedReplyText(captured);
+  const mentionCount = captured.parts.filter((part) => part.type === "mention").length;
+  const mediaCount = captured.mediaUrls.length;
+  const parts = [
+    text ? `text=${JSON.stringify(previewTextForLog(text, 160))}` : "",
+    mentionCount > 0 ? `mentions=${mentionCount}` : "",
+    mediaCount > 0 ? `media=${mediaCount}` : ""
+  ].filter(Boolean);
+
+  return parts.length > 0 ? parts.join(" ") : "empty=true";
+}
+
+function previewOutboundMessageForLog(outbound: string | OneBotMessageSegment[]): string {
+  if (typeof outbound === "string") {
+    return `mode=string text=${JSON.stringify(previewTextForLog(outbound, 180))}`;
+  }
+
+  const summarized = outbound.slice(0, 8).map((segment) => {
+    if (segment.type === "text") {
+      return { type: "text", text: previewTextForLog(String(segment.data?.text ?? ""), 80) };
+    }
+    if (segment.type === "at") {
+      return { type: "at", qq: String(segment.data?.qq ?? "") };
+    }
+    return { type: segment.type, data: segment.data ?? {} };
+  });
+  return `mode=segments value=${JSON.stringify(summarized)}`;
+}
+
 function appendOriginalSessionUserMirror(params: {
   body: unknown;
   fallbackText: string;
@@ -937,6 +1009,8 @@ async function deliverCapturedReply(api: any, target: ReplyTarget, captured: Cap
       ? String(message[0].data?.text ?? "")
       : message);
 
+  api.logger?.info?.(`[onebot] outbound reply target=${target.replyTarget} captured=${previewCapturedReplyForLog(captured)} ${previewOutboundMessageForLog(outbound)}`);
+
   if (target.isGroup && target.groupId) {
     await sendGroupMsg(target.groupId, outbound, () => getOneBotConfig(api));
     return;
@@ -961,14 +1035,54 @@ async function dispatchReply(api: any, runtime: any, params: {
 }): Promise<void> {
   setActiveReplyTarget(params.target.replyTarget);
 
+  const pendingMention: CapturedReply = { parts: [], textParts: [], mediaUrls: [] };
+  let hasPendingMention = false;
+
+  const flushPendingMention = async (): Promise<void> => {
+    if (!hasPendingMention || pendingMention.parts.length === 0) {
+      return;
+    }
+    api.logger?.info?.(`[onebot] reply payload flush pending target=${params.target.replyTarget} pending=${previewCapturedReplyForLog(pendingMention)}`);
+    await deliverCapturedReply(api, params.target, pendingMention);
+    pendingMention.parts = [];
+    pendingMention.textParts = [];
+    pendingMention.mediaUrls = [];
+    hasPendingMention = false;
+  };
+
   try {
     await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
       ctx: params.ctx,
       cfg: api.config,
       dispatcherOptions: {
         deliver: async (payload: unknown) => {
+          api.logger?.info?.(`[onebot] reply payload target=${params.target.replyTarget} ${previewReplyPayloadForLog(payload as ReplyPayload)}`);
           const captured: CapturedReply = { parts: [], textParts: [], mediaUrls: [] };
           appendCapturedReply(api, captured, payload as ReplyPayload);
+          api.logger?.info?.(`[onebot] reply payload parsed target=${params.target.replyTarget} ${previewCapturedReplyForLog(captured)}`);
+          if (captured.parts.length === 0) {
+            api.logger?.info?.(`[onebot] reply payload skipped-empty target=${params.target.replyTarget}`);
+            return;
+          }
+
+          if (isMentionOnlyCapturedReply(captured)) {
+            appendCapturedReplyState(pendingMention, captured);
+            hasPendingMention = true;
+            api.logger?.info?.(`[onebot] reply payload buffered-mention target=${params.target.replyTarget} pending=${previewCapturedReplyForLog(pendingMention)}`);
+            return;
+          }
+
+          if (hasPendingMention) {
+            appendCapturedReplyState(pendingMention, captured);
+            api.logger?.info?.(`[onebot] reply payload merged-with-pending target=${params.target.replyTarget} merged=${previewCapturedReplyForLog(pendingMention)}`);
+            await deliverCapturedReply(api, params.target, pendingMention);
+            pendingMention.parts = [];
+            pendingMention.textParts = [];
+            pendingMention.mediaUrls = [];
+            hasPendingMention = false;
+            return;
+          }
+
           await deliverCapturedReply(api, params.target, captured);
         },
         onError: async (error: unknown, info: { kind?: string }) => {
@@ -979,6 +1093,7 @@ async function dispatchReply(api: any, runtime: any, params: {
         disableBlockStreaming: true
       }
     });
+    await flushPendingMention();
   } finally {
     clearActiveReplyTarget();
   }
